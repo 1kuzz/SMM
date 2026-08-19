@@ -41,7 +41,13 @@
  * [10] unstableTokenPattern больше не бракует длинные стабильные классы (ant-collapse-header
  *      и т.п.), testIdAttribute по умолчанию — data-at-selector;
  * [11] __logger.registerProbe(name, fn) — предметный snapshot приложения до/после действия;
- * [12] __logger.expect(...) / __logger.note(...) — человеческие ассерты/заметки в момент записи.
+ * [12] __logger.expect(...) / __logger.note(...) — человеческие ассерты/заметки в момент записи;
+ * [13] console.log/console.info тоже пишутся в raw log (кроме сообщений самого логгера);
+ * [14] реордер строк через pointer events (не только HTML5 DnD) распознаётся как dragTo;
+ * [15] __logger.beginTask(meta) / endTask(result) — группировка таймлайна по страницам/задачам;
+ * [16] экспорт дедуплицирует снапшоты по fingerprint (screens[] + ссылки вместо копий) и
+ *      добавляет __logger.exportPlan() — компактный JSON-рецепт без сырых снапшотов/тел сети;
+ * [17] клики по ссылке с target=_blank помечаются requiresManualVerification.
  *
  * Команды:
  *   __logger.start() / pause() / stop() / destroy()
@@ -52,6 +58,8 @@
  *   __logger.copyLast()
  *   __logger.registerProbe(name, fn) / unregisterProbe(name)
  *   __logger.expect({ type, value }) / __logger.note(text)
+ *   __logger.beginTask({ locale, path }) / endTask({ status })
+ *   __logger.exportPlan()           // компактный JSON без сырых снапшотов/тел сети
  */
 (function () {
   'use strict';
@@ -76,6 +84,8 @@
     prompt: window.prompt,
     consoleError: console.error,
     consoleWarn: console.warn,
+    consoleLog: console.log,
+    consoleInfo: console.info,
     pushState: history.pushState,
     replaceState: history.replaceState,
     xhrOpen: XMLHttpRequest.prototype.open,
@@ -119,6 +129,10 @@
     uiEffectsPerAction: 40,
     screenMaxItems: 40,
 
+    // [v7.1][16] отдельно от trackLowLevelMouse (debug-only диагностика) — реордер строк
+    // через pointer events (не HTML5 DnD) иначе не попадает в лог вообще
+    trackPointerDrag: true,
+    pointerDragThresholdPx: 8,
     trackLowLevelMouse: false,
     trackAllKeyboard: false,
     trackFocus: false,
@@ -1010,11 +1024,15 @@
   const macroLog = restored && Array.isArray(restored.macroLog) ? restored.macroLog : [];
   const screenLog = restored && Array.isArray(restored.screenLog) ? restored.screenLog : [];
   const networkLog = restored && Array.isArray(restored.networkLog) ? restored.networkLog : [];
+  // [v7.1][19] группировка по страницам/задачам — плоский таймлайн на 20 страниц читать
+  // бесполезно, а per-page рецепт с фактическими значениями это то, из чего пишется код.
+  const tasksLog = restored && Array.isArray(restored.tasksLog) ? restored.tasksLog : [];
 
   window.__actionLog = rawLog;
   window.__macroLog = macroLog;
   window.__screenLog = screenLog;
   window.__networkLog = networkLog;
+  window.__tasksLog = tasksLog;
 
   let recording = true;
   let rawSeq = rawLog.length ? Math.max(...rawLog.map(x => Number(x.seq) || 0)) + 1 : 0;
@@ -1025,6 +1043,7 @@
   let pageSeq = restored && restored.pageSeq ? restored.pageSeq : 1;
   let requestSeq = restored && restored.requestSeq ? restored.requestSeq : 0;
   let currentAction = null;
+  let currentTask = restored && restored.currentTask ? restored.currentTask : null; // [v7.1][19]
   const actionsById = new Map();
   for (const a of macroLog) if (a && a.id) actionsById.set(a.id, a);
   let actionFinalizeTimer = null;
@@ -1099,6 +1118,8 @@
       screenLog,
       networkLog,
       rawLog,
+      tasksLog,
+      currentTask,
       pageSeq,
       requestSeq
     };
@@ -1122,6 +1143,8 @@
       lastUrl: location.href,
       savedAt: new Date().toISOString(),
       macroLog: macroLogForLocalStorage(),
+      tasksLog,
+      currentTask,
       pageSeq,
       requestSeq
     };
@@ -1214,6 +1237,9 @@
     const effects = action.effects || {};
     if (effects.navigation && effects.navigation.toUrl) add('url', effects.navigation.toUrl, 'high');
     if (effects.popup) add('popup', effects.popup.url || effects.popup.pageId || 'popup opened', 'high');
+    if (effects.popup && effects.popup.attachable === false) {
+      add('manual_verification_required', { url: effects.popup.url, reason: 'target=_blank popup not instrumented by a one-shot page script' }, 'high');
+    }
     for (const d of effects.dialogs || []) add('dialog', { type: d.type, message: d.message, accepted: d.accepted }, 'high');
     for (const d of effects.downloads || []) add('download', { filename: d.filename || null, href: d.href || null }, 'medium');
     for (const u of (effects.ui || []).slice(0, 12)) {
@@ -1315,10 +1341,13 @@
     action.rawSeqStart = Number.isInteger(action.rawSeqStart) ? action.rawSeqStart : Math.max(0, rawSeq - 1);
     action.sinceStartMs = Math.max(0, now - new Date(session.startedAt).getTime());
     action.locatorConfidence = locatorConfidence(action.locator);
+    action.taskId = currentTask ? currentTask.id : null;
     action.effects = action.effects || { network: [], ui: [], dialogs: [], downloads: [], errors: [], navigation: null, popup: null };
     const ctx = action.__ctx || ctxFor(action.__doc || document);
     const doc = action.__doc || document;
-    action.before = screenSnapshot(doc, ctx);
+    // [v7.1][16] dragTo подставляет свой pre-drag снапшот (нативный DOM к моменту pushMacro
+    // уже отражает НОВЫЙ порядок строк — снапшот "до" нужно взять до, а не в момент drop)
+    action.before = action.before || screenSnapshot(doc, ctx);
     if (action.before) recordScreen('before', action, ctx, action.before);
     action.probe = { before: null, after: null };
     try { action.probe.before = runProbes('before'); } catch (_) {}
@@ -1391,6 +1420,7 @@
   let effectObservers = [];
   let iframeObservers = [];
   let hoverCandidate = null;
+  let pointerDragCandidate = null; // [v7.1][16]
 
   function ctxFor(doc) {
     return docContexts.get(doc) || { label: 'top', frameChain: [], pageId: 'page-1' };
@@ -1781,8 +1811,12 @@
         if (anchor && anchor.target === '_blank' && action && !action.resultPopup) {
           const info = { url: sanitizeUrl(anchor.href), via: 'target_blank', pageId: `page-${++pageSeq}`, attachable: false };
           action.resultPopup = info;
+          // [v7.1][21] результат такого клика логгер проверить не может — явно помечаем,
+          // что нужна ручная верификация, вместо тихой потери факта проверки.
+          action.requiresManualVerification = true;
           ensureEffects(action).popup = info;
           action.inferredExpected = deriveExpected(action);
+          console.log('%c[logger] открылась вкладка (target=_blank) — результат не инструментируется. Проверьте вручную и вызовите __logger.expect({...}) или __logger.note("...").', 'color:orange');
         }
       } catch (_) {}
     });
@@ -2021,6 +2055,55 @@
       }
       dragSource = null;
     });
+
+    // [v7.1][16] реордер через pointer events (без нативного HTML5 DnD) — AntD/rc-компоненты
+    // часто двигают строки так, а не через dragstart/drop, и раньше это не писалось вообще.
+    const DRAG_HANDLE_SELECTOR = '[draggable="true"],tr,[role="row"],.ant-table-row,.ant-list-item,li,'
+      + '[class*="drag-handle" i],[class*="draghandle" i],[class*="sortable" i],[class*="dnd" i],[class*="drag" i]';
+    const DRAG_EXCLUDE_SELECTOR = 'input,textarea,select,[contenteditable="true"],.cm-editor,button,a,[role="button"]';
+
+    on(doc, 'pointerdown', e => {
+      if (!config.trackPointerDrag) return;
+      const t = actualTarget(e);
+      if (!t || isIgnoredEl(t)) return;
+      if (safeMatches(t, DRAG_EXCLUDE_SELECTOR) || (t.closest && t.closest(DRAG_EXCLUDE_SELECTOR))) return;
+      if (!safeMatches(t, DRAG_HANDLE_SELECTOR) && !(t.closest && t.closest(DRAG_HANDLE_SELECTOR))) return;
+      pointerDragCandidate = {
+        pointerId: e.pointerId, startEl: t, ctx, doc,
+        startX: e.clientX, startY: e.clientY, moved: false, before: null
+      };
+    });
+
+    on(doc, 'pointermove', e => {
+      const c = pointerDragCandidate;
+      if (!c || c.pointerId !== e.pointerId || c.moved) return;
+      const dx = e.clientX - c.startX, dy = e.clientY - c.startY;
+      if (Math.hypot(dx, dy) < config.pointerDragThresholdPx) return;
+      c.moved = true;
+      // полный (не light) снапшот — только он несёт inputs/rows, нужные для diff порядка;
+      // это разовая цена одного реального drag-жеста, не за каждый pointermove
+      try { c.before = screenSnapshot(c.doc, c.ctx); } catch (_) {}
+    });
+
+    const endPointerDrag = e => {
+      const c = pointerDragCandidate;
+      pointerDragCandidate = null;
+      if (!c || !c.moved || (e.pointerId != null && c.pointerId !== e.pointerId)) return;
+      const endT = actualTarget(e) || c.startEl;
+      pushMacro({
+        action: 'dragTo',
+        source: macroTarget(c.startEl, c.ctx),
+        destination: macroTarget(endT, c.ctx),
+        via: 'pointer',
+        before: c.before,
+        frameChain: c.ctx.frameChain || [],
+        pageId: c.ctx.pageId || 'page-1',
+        __ctx: c.ctx,
+        __doc: c.doc
+      });
+    };
+    on(doc, 'pointerup', endPointerDrag);
+    on(doc, 'pointercancel', endPointerDrag);
 
     setTimeout(() => attachIframes(doc, ctx), 0);
     watchIframes(doc, ctx);
@@ -2343,6 +2426,23 @@
     return native.consoleWarn.apply(console, args);
   };
 
+  // [v7.1][17] console.log/info раньше не писались вообще. Сообщения самого логгера
+  // ("[logger] ...") отфильтровываются, чтобы не засорять raw log собственной болтовнёй.
+  function isLoggerOwnMessage(args) {
+    const first = args && args[0];
+    return typeof first === 'string' && first.indexOf('[logger') !== -1;
+  }
+
+  console.log = function (...args) {
+    if (!isLoggerOwnMessage(args)) pushRaw({ kind: 'console', type: 'log', args: args.map(a => trunc(String(a), 300)) });
+    return native.consoleLog.apply(console, args);
+  };
+
+  console.info = function (...args) {
+    if (!isLoggerOwnMessage(args)) pushRaw({ kind: 'console', type: 'info', args: args.map(a => trunc(String(a), 300)) });
+    return native.consoleInfo.apply(console, args);
+  };
+
   // --------------------------------------------------------------- network
 
   // [2] input может быть string | URL | Request
@@ -2594,6 +2694,38 @@
     };
   }
 
+  // [v7.1][11] один и тот же снапшот раньше попадал в экспорт дважды: целиком внутри
+  // action.before/after И отдельной записью в screenLog. Дедуп только на экспорте (по
+  // fingerprint) — runtime screenDiff/deriveExpected продолжают работать с живыми
+  // объектами как раньше, это чисто изменение формы итогового JSON.
+  function dedupScreens(actions) {
+    const byFingerprint = new Map();
+    const screens = [];
+    function addSnapshot(snapshot) {
+      if (!snapshot) return null;
+      const fp = snapshot.fingerprint || null;
+      if (fp && byFingerprint.has(fp)) return byFingerprint.get(fp);
+      const id = `scr-${screens.length}`;
+      screens.push({ id, ...snapshot });
+      if (fp) byFingerprint.set(fp, id);
+      return id;
+    }
+    function refFor(snapshot) {
+      if (!snapshot) return null;
+      const id = addSnapshot(snapshot);
+      return { ref: id, fingerprint: snapshot.fingerprint || null, url: snapshot.url || null, title: snapshot.title || null };
+    }
+    for (const a of actions) {
+      if (a.before) a.before = refFor(a.before);
+      if (a.after) a.after = refFor(a.after);
+    }
+    // прочие записи screenLog (session_start и т.п.), не покрытые before/after ни одного действия
+    for (const entry of screenLog) {
+      if (entry && entry.snapshot) addSnapshot(entry.snapshot);
+    }
+    return screens;
+  }
+
   function cleanActionForExport(action) {
     const out = {};
     for (const [k, v] of Object.entries(action || {})) {
@@ -2651,7 +2783,7 @@
       }
       if (a.effects && a.effects.errors && a.effects.errors.length) warnings.push({ type: 'runtime_error', actionId: a.id, errors: a.effects.errors });
       if (a.action === 'setFiles') warnings.push({ type: 'file_paths_not_recorded', actionId: a.id, files: a.files });
-      if (a.resultPopup && a.resultPopup.attachable === false) warnings.push({ type: 'popup_not_instrumented', actionId: a.id, popup: a.resultPopup, note: 'target=_blank popup cannot be automatically instrumented from a one-shot DevTools page script' });
+      if (a.resultPopup && a.resultPopup.attachable === false) warnings.push({ type: 'popup_not_instrumented', actionId: a.id, popup: a.resultPopup, note: 'target=_blank popup cannot be automatically instrumented from a one-shot DevTools page script — requires __logger.expect()/note() during the manual run' });
     }
     return warnings;
   }
@@ -2688,8 +2820,19 @@
     lines.push('');
     lines.push('## Ordered steps');
     lines.push('');
+    const taskById = new Map((tasksLog || []).map(t => [t.id, t]));
+    let openTaskId = undefined;
     for (const a of actions) {
       if (a.action === 'mark') continue;
+      if (a.taskId !== openTaskId) {
+        openTaskId = a.taskId;
+        if (openTaskId) {
+          const task = taskById.get(openTaskId);
+          const label = task && task.meta ? JSON.stringify(task.meta) : openTaskId;
+          lines.push(`## Task: ${label}`);
+          lines.push('');
+        }
+      }
       lines.push(`### ${a.order}. ${actionHuman(a)}`);
       lines.push(`- actionId: ${a.id}`);
       lines.push(`- page/frame: ${a.pageId || 'page-1'} / ${(a.frameChain || []).join(' -> ') || 'top'}`);
@@ -2721,6 +2864,7 @@
     const actions = macroLog.map(cleanActionForExport);
     const variables = buildVariables(actions);
     const warnings = buildWarnings(actions);
+    const screens = dedupScreens(actions);
     const payload = {
       schema: 'action-logger-ai-v7',
       schemaPurpose: 'AI-first deterministic browser trace for reconstructing user steps, drafting requirements, and generating macros/tests',
@@ -2732,7 +2876,8 @@
       stats: {
         rawEvents: rawLog.length,
         macroActions: actions.length,
-        screenSnapshots: screenLog.length,
+        screenSnapshotsCaptured: screenLog.length,
+        screenSnapshotsDeduped: screens.length,
         networkEntries: networkLog.length,
         weakLocators: actions.filter(a => a.locatorConfidence && a.locatorConfidence.level === 'low').length,
         backupMode
@@ -2747,9 +2892,10 @@
         popupRule: 'pageId separates browser pages when observable; target=_blank may be recorded but not instrumented by a one-shot page script'
       },
       timeline: actions,
+      tasks: tasksLog,
       variables,
       warnings,
-      screens: screenLog,
+      screens,
       network: networkLog,
       rawLog,
       generated: {
@@ -2775,6 +2921,60 @@
     };
     deliver(filename, JSON.stringify(payload, null, 2));
     console.log(`[logger] macro: ${macroLog.length} actions`);
+  }
+
+  // [v7.1][11] компактный "рецепт" для ассистента — без полных снапшотов/тел сети/rawLog,
+  // только то, из чего пишется код: локатор, значение(+hash), contextChain, diff-сводка.
+  function buildPlan(actions) {
+    return actions.map(a => ({
+      order: a.order,
+      id: a.id,
+      taskId: a.taskId || null,
+      t: a.iso,
+      action: a.action,
+      human: actionHuman(a),
+      locator: a.locator ? { primary: a.locator.primary, pw: a.locator.pw, confidence: a.locatorConfidence } : null,
+      contextChain: a.contextChain || [],
+      // большой CM6/textarea-текст сюда не тащим целиком (это отдельно есть в AI JSON) —
+      // только превью + hash/length + line-diff, этого достаточно, чтобы понять что менялось
+      value: a.isLargeText && typeof a.value === 'string' ? trunc(a.value, 500) : a.value,
+      valueLength: a.valueLength || null,
+      valueHash: a.valueHash || null,
+      isLargeText: !!a.isLargeText,
+      textDiff: a.textDiff || null,
+      checked: a.checked,
+      antd: a.antd || null,
+      requiresManualVerification: a.requiresManualVerification || false,
+      artifacts: (a.artifacts || []).map(x => ({ name: x.name, size: x.size, contentHash: x.contentHash || null, contentCaptured: !!x.contentCaptured })),
+      network: (a.effects && a.effects.network || []).filter(n => n.phase !== 'start').map(n => ({ method: n.method, url: n.requestUrl, status: n.status, hasBody: n.responsePreview != null })),
+      inferredExpected: a.inferredExpected || [],
+      humanExpected: a.humanExpected || [],
+      humanNotes: a.humanNotes || [],
+      diffSummary: a.diff ? {
+        urlChanged: a.diff.urlChanged || null,
+        titleChanged: a.diff.titleChanged || null,
+        inputsChanged: (a.diff.inputs && a.diff.inputs.changed || []).length,
+        inputsOrderChanged: !!a.diff.inputsOrderChanged,
+        dialogsAdded: (a.diff.dialogs && a.diff.dialogs.added || []).length,
+        alertsAdded: (a.diff.alerts && a.diff.alerts.added || []).length
+      } : null
+    }));
+  }
+
+  function exportPlan(filename = `action-plan-v7-${Date.now()}.json`) {
+    finalizeAllActions();
+    const actions = macroLog.map(cleanActionForExport);
+    const payload = {
+      schema: 'action-logger-plan-v7',
+      version: VERSION,
+      exportedAt: new Date().toISOString(),
+      session: { id: session.id, startUrl: session.startUrl, startedAt: session.startedAt },
+      tasks: tasksLog,
+      steps: buildPlan(actions)
+    };
+    deliver(filename, JSON.stringify(payload, null, 2));
+    console.log(`[logger] plan: ${payload.steps.length} шагов`);
+    return payload;
   }
 
   // ------------------------------------------------- [9][10][15] Playwright
@@ -3110,6 +3310,7 @@
           ${button('🏷 Метка', '__al-mark')}
           ${button('📊 Статы', '__al-stats')}
           ${button('💾 AI JSON', '__al-export')}
+          ${button('📝 Plan', '__al-export-plan')}
           ${button('▶ PW отдельно', '__al-export-pw')}
           ${button('■ Стоп + экспорт', '__al-stop')}
           ${button('📋 Копия', '__al-copy')}
@@ -3139,6 +3340,7 @@
     });
     panel.querySelector('#__al-stats').addEventListener('click', stats);
     panel.querySelector('#__al-export').addEventListener('click', () => exportBundle());
+    panel.querySelector('#__al-export-plan').addEventListener('click', () => exportPlan());
     panel.querySelector('#__al-export-pw').addEventListener('click', () => exportPlaywright());
     panel.querySelector('#__al-copy').addEventListener('click', copyLast);
     panel.querySelector('#__al-stop').addEventListener('click', stop);
@@ -3220,8 +3422,10 @@
     macroLog.length = 0;
     screenLog.length = 0;
     networkLog.length = 0;
+    tasksLog.length = 0;
     actionsById.clear();
     currentAction = null;
+    currentTask = null;
     rawSeq = 0;
     macroSeq = 0;
     requestSeq = 0;
@@ -3246,6 +3450,39 @@
     pushRaw({ kind: 'mark', type: 'mark', label: text });
     pushMacro({ action: 'mark', label: text, frameChain: [] });
     console.log(`%c[logger] метка: ${text}`, 'color:magenta');
+  }
+
+  // [v7.1][19] __logger.beginTask({locale, path}) / endTask({status, reason}) — режет плоский
+  // таймлайн на задачи (обычно "одна страница"), чтобы в bundle появился per-page рецепт.
+  function beginTask(meta) {
+    if (currentTask && !currentTask.endedAt) endTask({ status: 'superseded_by_next_task' });
+    currentTask = {
+      id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      startedAt: new Date().toISOString(),
+      startActionSeq: macroLog.length,
+      meta: sanitizeObject(meta || {}, 0, config.maxText)
+    };
+    pushRaw({ kind: 'task', type: 'begin', task: currentTask });
+    saveBackup(true);
+    console.log(`%c[logger] task начат`, 'color:cyan', currentTask.meta);
+    return currentTask;
+  }
+
+  function endTask(result) {
+    if (!currentTask) {
+      console.log('[logger] нет активной задачи — beginTask() не вызывался.');
+      return null;
+    }
+    currentTask.endedAt = new Date().toISOString();
+    currentTask.endActionSeq = macroLog.length;
+    currentTask.result = sanitizeObject(result || {}, 0, config.maxText);
+    pushRaw({ kind: 'task', type: 'end', task: currentTask });
+    tasksLog.push(currentTask);
+    const finished = currentTask;
+    currentTask = null;
+    saveBackup(true);
+    console.log(`%c[logger] task завершён`, 'color:cyan', finished.result);
+    return finished;
   }
 
   // [v7.1][18] inferredExpected угадывает по факту последствий, но человек в ручном
@@ -3305,6 +3542,8 @@
     try { window.prompt = native.prompt; } catch (_) {}
     try { console.error = native.consoleError; } catch (_) {}
     try { console.warn = native.consoleWarn; } catch (_) {}
+    try { console.log = native.consoleLog; } catch (_) {}
+    try { console.info = native.consoleInfo; } catch (_) {}
     try { history.pushState = native.pushState; } catch (_) {}
     try { history.replaceState = native.replaceState; } catch (_) {}
     try { HTMLAnchorElement.prototype.click = native.anchorClick; } catch (_) {}
@@ -3316,7 +3555,18 @@
     console.log('[logger] полностью выгружен.');
   }
 
-  buildPanel();
+  // [v7.1][12] нужен для запуска как content script на document_start (см. manifest.json) —
+  // патчить fetch/XHR/history/console нужно ДО того, как страница сделает первый запрос,
+  // но document.body в этот момент ещё может не существовать, а buildPanel() пишет в body.
+  function whenBodyReady(fn) {
+    if (document.body) { fn(); return; }
+    const obs = new MutationObserver(() => {
+      if (document.body) { obs.disconnect(); fn(); }
+    });
+    try { obs.observe(document.documentElement, { childList: true }); } catch (_) { fn(); }
+  }
+
+  whenBodyReady(buildPanel);
 
   window.__logger = {
     version: VERSION,
@@ -3332,6 +3582,9 @@
     stop,
     clear,
     mark,
+    beginTask,
+    endTask,
+    tasksLog,
     expect: expectFact,
     note,
     registerProbe(name, fn) {
@@ -3352,6 +3605,7 @@
     export: exportBundle,
     exportAI: exportBundle,
     exportMacro,
+    exportPlan,
     exportPlaywright,
     generatePlaywright,
     copyLast,
