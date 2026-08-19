@@ -23,8 +23,8 @@
  * а не только восстановить хореографию кликов):
  *  [1] полный (не innerText!) текст CodeMirror 6 через node.cmView.view.state.doc.toString(),
  *      плюс построчный diff между началом и концом серии debounce-вводов в одном поле;
- *  [2] request/response тела всегда сохраняются на bodyCaptureAllowlist URL
- *      (fileServer/add, getDirectoryInfo, /api/transaction) — независимо от общих флагов;
+ *  [2] request/response тела всегда сохраняются для запросов, коррелированных с действием
+ *      пользователя (см. v7.2 [1] — правило с тех пор стало общим, без списка URL);
  *  [3] содержимое загружаемых текстовых файлов (File.text()) с hash — не только name/size/type;
  *  [4] семантика Ant Design: Select-опция из портала, Switch, Radio, Collapse-заголовок,
  *      кнопки Popconfirm/Modal распознаются вместо безымянного "клик по div";
@@ -39,7 +39,7 @@
  *      синхронного restore сразу после reload;
  *  [9] fetch/XHR патчатся не только в top-window, но и в каждом same-origin iframe/popup;
  * [10] unstableTokenPattern больше не бракует длинные стабильные классы (ant-collapse-header
- *      и т.п.), testIdAttribute по умолчанию — data-at-selector;
+ *      и т.п.) — см. v7.2 [2] про автоопределение testIdAttribute на любом сайте;
  * [11] __logger.registerProbe(name, fn) — предметный snapshot приложения до/после действия;
  * [12] __logger.expect(...) / __logger.note(...) — человеческие ассерты/заметки в момент записи;
  * [13] console.log/console.info тоже пишутся в raw log (кроме сообщений самого логгера);
@@ -48,6 +48,29 @@
  * [16] экспорт дедуплицирует снапшоты по fingerprint (screens[] + ссылки вместо копий) и
  *      добавляет __logger.exportPlan() — компактный JSON-рецепт без сырых снапшотов/тел сети;
  * [17] клики по ссылке с target=_blank помечаются requiresManualVerification.
+ *
+ * v7.2 — инструмент больше не заточен под один конкретный сайт: то, что раньше требовало
+ * ручной настройки под SiteEditor, теперь определяется в рантайме на любой странице:
+ *  [1] bodyCaptureAllowlist (список URL) убран — общее правило "тело сохраняется для
+ *      любого запроса, коррелированного с действием пользователя, или для ошибки сети",
+ *      работает без знания конкретных эндпоинтов; __logger.captureBodiesFor(pattern) —
+ *      ручной override сверху для несвязанных с действиями запросов;
+ *  [2] discoverCustomIdAttributes() сканирует интерактивные элементы, находит частые
+ *      стабильные кастомные атрибуты (data-at-selector, data-qa-id, data-hook, ...) и сам
+ *      выбирает testIdAttribute — без знания разметки сайта заранее;
+ *  [3] generic ARIA-слой (role=option/listbox/switch/tab/[aria-expanded]) поверх
+ *      AntD-детектора — семантика Select/Switch/Collapse распознаётся и на не-AntD сайтах;
+ *      contextChain (активная вкладка/заголовок панели) починен — раньше el.closest() не
+ *      мог найти активный таб/заголовок, т.к. это соседи по DOM, а не предки;
+ *  [4] action.destructive — эвристика по тексту/классам (delete/remove/discard/danger...);
+ *  [5] action.possibleRetry — повтор клика по тому же локатору без видимого эффекта между
+ *      попытками — сигнал, что в скрипте нужен явный wait;
+ *  [6] __logger.setMacroName(name) — recording'и различаются по имени, а не только по id
+ *      сессии, если инструмент используется для многих разных сценариев/сайтов подряд;
+ *  [7] payload.openQuestions[] — автосборка "что уточнить у оператора" (слабые локаторы без
+ *      подтверждения, неинструментированные попапы, возможные retry, разрушительные шаги без
+ *      видимого эффекта, неподтверждённые сетевые ошибки) — готовый чек-лист, а не то, что
+ *      получателю нужно вычислять самому по всему таймлайну.
  *
  * Команды:
  *   __logger.start() / pause() / stop() / destroy()
@@ -60,12 +83,14 @@
  *   __logger.expect({ type, value }) / __logger.note(text)
  *   __logger.beginTask({ locale, path }) / endTask({ status })
  *   __logger.exportPlan()           // компактный JSON без сырых снапшотов/тел сети
+ *   __logger.setMacroName(name)     // имя для файлов экспорта при множестве записей
+ *   __logger.captureBodiesFor(pattern) / rediscoverIdAttributes() / setTestIdAttribute(name)
  */
 (function () {
   'use strict';
 
-  const VERSION = '7.1.0';
-  const STORAGE_KEY = '__actionLoggerBackup_v7_1';
+  const VERSION = '7.2.0';
+  const STORAGE_KEY = '__actionLoggerBackup_v7_2';
   const IDB_NAME = '__actionLoggerBackupV7';
   const IDB_STORE = 'backup';
 
@@ -106,13 +131,12 @@
     maxScreenSnapshots: 3500,
     maxNetworkEntries: 6000,
 
-    // [v7.1] на этих URL тело запроса/ответа сохраняется всегда, даже если
-    // captureNetworkBodies/captureResponseBodies выключены — без них миграция недоказуема
-    bodyCaptureAllowlist: [
-      '/api/fileServer/add',
-      'getDirectoryInfo',
-      '/api/transaction'
-    ],
+    // [v7.2] сайт-специфичного списка URL больше нет — вместо него общее правило:
+    // тело всегда сохраняется для запроса, коррелированного с действием пользователя
+    // (actionId != null), или для любого запроса с ошибкой. Работает на любом сайте без
+    // настройки. Этот список — только ручной override сверху общего правила (пуст по умолчанию,
+    // пополняется через __logger.captureBodiesFor(pattern) для несвязанных с действиями запросов).
+    bodyCaptureAllowlist: [],
     bodyCaptureAllowlistMaxBytes: 200000,
 
     // [7] бэкап по времени, а не по количеству событий
@@ -156,9 +180,12 @@
     // [9][10] генерация теста
     playwrightTextMethod: 'fill', // fill | pressSequentially
     playwrightLocators: 'semantic', // semantic | css
-    // [v7.1] SiteEditor использует data-at-selector, а не data-testid — это самый дешёвый
-    // способ поднять качество локаторов (см. [data-at-selector="plugin-view-header"])
-    testIdAttribute: 'data-at-selector',
+    // [v7.2] нейтральный дефолт по конвенции Playwright; на конкретном сайте переопределяется
+    // автоматически через discoverCustomIdAttributes() — см. ниже — без ручной настройки
+    testIdAttribute: 'data-testid',
+    testIdAttributeManuallySet: false,
+    autoDiscoverTestIdAttribute: true,
+    discoveredIdAttributes: [], // заполняется discoverCustomIdAttributes() в рантайме
     emitAssertions: true,
     emitSteps: true,
 
@@ -199,6 +226,12 @@
     ],
 
     sensitiveNamePattern: /pass(word)?|pwd|secret|token|auth|authorization|cookie|session|csrf|api[-_]?key|access[-_]?key|private[-_]?key|credit|card|cvv|cvc|otp|pin/i,
+    // [v7.2] клики, похожие на необратимое действие — помечаются action.destructive=true,
+    // чтобы в сгенерированном скрипте такие шаги шли под подтверждение, а не выполнялись
+    // молча наравне с открытием вкладки. Общий по тексту/классам эвристический паттерн,
+    // не завязан на конкретный сайт.
+    destructiveWordPattern: /\b(delete|remove|discard|purge|destroy|reject|revoke|unpublish|drop)\b|удал|отклон|отказ|очистить всё|сбросить всё/i,
+    destructiveClassPattern: /danger|destructive|delete|remove|warn/i,
     // [v7.1] классы/атрибуты с этими префиксами считаются стабильными независимо от длины —
     // старое правило "18+ символов = нестабильно" браковало ant-collapse-header (19),
     // ant-select-selection-item (25) и другие обычные классы дизайн-системы
@@ -327,10 +360,21 @@
     return trunc(value, limit);
   }
 
-  // [v7.1] на URL из bodyCaptureAllowlist тело сохраняется всегда — это единственные
-  // ответы/запросы, которые реально доказывают результат миграции
+  // [v7.2] сайт-специфичного списка URL больше нет. Общее, работающее на любом сайте правило:
+  // тело сохраняется всегда для запроса, который вызвало действие пользователя (actionId
+  // известен — почти всегда это то, что реально доказывает результат шага), для любой ошибки
+  // сети (диагностика), и для URL из ручного override-списка (__logger.captureBodiesFor()).
   function isAllowlistedForBody(url) {
     return !!url && config.bodyCaptureAllowlist.some(p => String(url).includes(p));
+  }
+
+  function shouldCaptureBody(url, meta) {
+    meta = meta || {};
+    if (isAllowlistedForBody(url)) return true;
+    if (meta.actionId) return true;
+    if (meta.status != null && meta.status >= 400) return true;
+    if (meta.ok === false) return true;
+    return false;
   }
 
   // forceCapture=true игнорирует captureNetworkBodies и использует bodyCaptureAllowlistMaxBytes
@@ -371,6 +415,59 @@
     const s = String(token);
     if (config.stableTokenPrefixes.some(p => s.startsWith(p))) return true;
     return !config.unstableTokenPattern.test(s);
+  }
+
+  // [v7.2] "пусть сам узнает всё о сайте": вместо жёстко зашитого имени test-id атрибута
+  // сканируем интерактивные элементы и ищем часто повторяющиеся кастомные атрибуты со
+  // стабильными (не хэш-подобными) значениями — именно так выглядит QA/test-id атрибут,
+  // каким бы именем его ни назвали на конкретном сайте (data-at-selector, data-qa-id,
+  // data-cy-id, data-auto, data-hook, ...).
+  const COMMON_HTML_ATTRS = new Set([
+    'id', 'class', 'style', 'type', 'name', 'href', 'src', 'role', 'tabindex', 'disabled',
+    'checked', 'readonly', 'placeholder', 'value', 'title', 'alt', 'target', 'rel', 'for',
+    'action', 'method', 'width', 'height', 'colspan', 'rowspan', 'draggable', 'contenteditable',
+    'spellcheck', 'autocomplete', 'maxlength', 'minlength', 'min', 'max', 'step', 'pattern',
+    'required', 'multiple', 'selected', 'size', 'accept', 'autofocus', 'autoplay', 'controls',
+    'loop', 'muted', 'download', 'lang', 'dir', 'translate', 'hidden', 'inert', 'nonce',
+    'crossorigin', 'referrerpolicy', 'sandbox', 'allow', 'loading', 'decoding', 'sizes', 'srcset'
+  ]);
+
+  function discoverCustomIdAttributes(doc = document) {
+    try {
+      const freq = new Map();
+      const candidates = doc.querySelectorAll('button,a,input,select,textarea,[role],[onclick],[tabindex]');
+      let scanned = 0;
+      for (const el of candidates) {
+        if (++scanned > 4000) break;
+        const names = el.getAttributeNames ? el.getAttributeNames() : [];
+        for (const name of names) {
+          if (COMMON_HTML_ATTRS.has(name) || name.startsWith('aria-') || name.startsWith('on') || name.startsWith('data-v-') || name.startsWith('data-react')) continue;
+          const value = el.getAttribute(name);
+          if (!value || value.length > 100 || !stableToken(value)) continue;
+          freq.set(name, (freq.get(name) || 0) + 1);
+        }
+      }
+      return [...freq.entries()]
+        .filter(([, count]) => count >= 3)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([name]) => name);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function runIdAttributeDiscovery() {
+    if (!config.autoDiscoverTestIdAttribute) return;
+    const found = discoverCustomIdAttributes(document);
+    if (!found.length) return;
+    config.discoveredIdAttributes = found;
+    // getByTestId в сгенерированном Playwright может проверять только ОДНО имя атрибута —
+    // берём самый частый кандидат, если пользователь явно не переопределил testIdAttribute
+    if (!config.testIdAttributeManuallySet) {
+      config.testIdAttribute = found[0];
+    }
+    console.log(`%c[logger] обнаружены вероятные test-id атрибуты сайта: ${found.join(', ')} (используется: ${config.testIdAttribute})`, 'color:lime');
   }
 
   // ------------------------------------------------ [1] shadow-aware локаторы
@@ -570,7 +667,11 @@
     const tag = el.tagName.toLowerCase();
     const candidates = [];
 
-    for (const attr of ['data-at-selector', 'data-testid', 'data-test', 'data-qa', 'data-cy']) {
+    // [v7.2] config.discoveredIdAttributes заполняется discoverCustomIdAttributes() —
+    // это позволяет находить стабильные test-id-подобные атрибуты на ЛЮБОМ сайте, а не
+    // только по фиксированному списку общеизвестных имён
+    const testIdAttrs = new Set([config.testIdAttribute, ...config.discoveredIdAttributes, 'data-at-selector', 'data-testid', 'data-test', 'data-qa', 'data-cy']);
+    for (const attr of testIdAttrs) {
       const value = el.getAttribute(attr);
       if (value && stableToken(value)) {
         const css = `[${attr}="${quoteAttr(value)}"]`;
@@ -1016,9 +1117,11 @@
     startedAt: new Date().toISOString(),
     startUrl: location.href,
     startTitle: document.title,
+    macroName: null, // [v7.2] __logger.setMacroName(...) — иначе выводится из pathname при экспорте
     env: environment()
   };
   if (!session.env) session.env = environment();
+  if (session.macroName === undefined) session.macroName = null;
 
   const rawLog = restored && Array.isArray(restored.rawLog) ? restored.rawLog : [];
   const macroLog = restored && Array.isArray(restored.macroLog) ? restored.macroLog : [];
@@ -1044,6 +1147,7 @@
   let requestSeq = restored && restored.requestSeq ? restored.requestSeq : 0;
   let currentAction = null;
   let currentTask = restored && restored.currentTask ? restored.currentTask : null; // [v7.1][19]
+  let idAttributeDiscoveryRanAfterNav = false; // [v7.2]
   const actionsById = new Map();
   for (const a of macroLog) if (a && a.id) actionsById.set(a.id, a);
   let actionFinalizeTimer = null;
@@ -1314,6 +1418,28 @@
     return action.effects;
   }
 
+  // [v7.2] тот же локатор + тот же тип действия повторно в пределах 15с, а предыдущий раз
+  // ничего видимо не изменил — почти всегда значит "не дождались", намёк на нужный wait
+  // в сгенерированном скрипте, а не два независимых шага.
+  const POSSIBLE_RETRY_WINDOW_MS = 15000;
+  function detectPossibleRetry(action) {
+    if (!action.locator || !action.locator.primary || !action.locator.primary.css) return null;
+    const css = action.locator.primary.css;
+    for (let i = macroLog.length - 1; i >= 0 && i >= macroLog.length - 20; i--) {
+      const prev = macroLog[i];
+      if (!prev || prev.action !== action.action) continue;
+      if (!prev.locator || !prev.locator.primary || prev.locator.primary.css !== css) continue;
+      const gap = (action.t || Date.now()) - prev.t;
+      if (gap > POSSIBLE_RETRY_WINDOW_MS) return null;
+      if (prev.finalizedAt && prev.diff && !prev.diff.fingerprintChanged &&
+          !(prev.diff.inputs && prev.diff.inputs.changed && prev.diff.inputs.changed.length)) {
+        return { previousActionId: prev.id, gapMs: gap };
+      }
+      return null;
+    }
+    return null;
+  }
+
   function pushMacro(action) {
     if (!recording || internalDepth || !action) return null;
 
@@ -1342,6 +1468,7 @@
     action.sinceStartMs = Math.max(0, now - new Date(session.startedAt).getTime());
     action.locatorConfidence = locatorConfidence(action.locator);
     action.taskId = currentTask ? currentTask.id : null;
+    action.possibleRetry = detectPossibleRetry(action);
     action.effects = action.effects || { network: [], ui: [], dialogs: [], downloads: [], errors: [], navigation: null, popup: null };
     const ctx = action.__ctx || ctxFor(action.__doc || document);
     const doc = action.__doc || document;
@@ -1426,26 +1553,55 @@
     return docContexts.get(doc) || { label: 'top', frameChain: [], pageId: 'page-1' };
   }
 
-  // [v7.1][7] "к какой строке относится этот select/delete" — активная вкладка, заголовок
-  // раскрытой панели и URL ассета из ближайшей строки. Без этого локатор вида nth-of-type
-  // ничего не говорит о том, какую именно строку затронуло действие.
-  function nearestText(el, selector, maxLen) {
+  // [v7.1/v7.2][7] "к какой строке относится этот select/delete" — активная вкладка, заголовок
+  // раскрытой панели и URL из ближайшей строки. Без этого локатор вида nth-of-type ничего не
+  // говорит о том, какую именно строку затронуло действие.
+  function nearestRowUrl(el) {
     try {
-      const found = el && el.closest ? el.closest(selector) : null;
-      if (!found) return null;
-      return collapse(found.innerText || found.textContent || '', maxLen || 160) || null;
+      const row = el && el.closest ? el.closest('tr,[role="row"],[role="listitem"],.ant-list-item,.ant-table-row,li') : null;
+      if (!row) return null;
+      const urlInput = row.querySelector('input[type="text"],input[type="url"],input:not([type])');
+      if (urlInput && urlInput.value) return trunc(urlInput.value, 500);
+      return null;
     } catch (_) {
       return null;
     }
   }
 
-  function nearestRowUrl(el) {
+  // [v7.2] Активная вкладка/заголовок панели почти никогда не являются ПРЕДКОМ элемента
+  // внутри их содержимого (это соседи по DOM: .ant-collapse-header — сосед .ant-collapse-content,
+  // а не его родитель) — el.closest() тут в принципе не может найти совпадение. Нужно сначала
+  // подняться до общего контейнера, а затем поискать заголовок/таб уже внутри него.
+  function nearestActiveTabLabel(el, maxLen) {
     try {
-      const row = el && el.closest ? el.closest('tr,[role="row"],.ant-list-item,.ant-table-row,li') : null;
-      if (!row) return null;
-      const urlInput = row.querySelector('input[type="text"],input[type="url"],input:not([type])');
-      if (urlInput && urlInput.value && /^(https?:)?\/\//i.test(urlInput.value.trim())) return trunc(urlInput.value, 500);
-      if (urlInput && urlInput.value) return trunc(urlInput.value, 500);
+      const container = el.closest('.ant-tabs, [role="tablist"], [class*="tabs" i]');
+      if (!container) return null;
+      const activeTab = container.querySelector('.ant-tabs-tab-active .ant-tabs-tab-btn, .ant-tabs-tab-active, [role="tab"][aria-selected="true"]');
+      if (!activeTab) return null;
+      return collapse(activeTab.innerText || activeTab.textContent || '', maxLen || 160) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function nearestPanelHeaderLabel(el, maxLen) {
+    try {
+      const item = el.closest('.ant-collapse-item');
+      if (item) {
+        const header = item.querySelector('.ant-collapse-header');
+        if (header) return collapse(header.innerText || header.textContent || '', maxLen || 160) || null;
+      }
+      // generic ARIA: подняться по предкам и поискать элемент с id, на который где-то
+      // в документе ссылается aria-controls (стандартный паттерн disclosure/accordion)
+      let node = el, hops = 0;
+      while (node && node !== document.body && hops < 8) {
+        if (node.id) {
+          const trigger = document.querySelector(`[aria-controls="${quoteAttr(node.id)}"]`);
+          if (trigger) return collapse(trigger.innerText || trigger.textContent || '', maxLen || 160) || null;
+        }
+        node = node.parentElement;
+        hops++;
+      }
       return null;
     } catch (_) {
       return null;
@@ -1455,9 +1611,9 @@
   function buildContextChain(el) {
     const chain = [];
     try {
-      const tab = nearestText(el, '.ant-tabs-tab-active .ant-tabs-tab-btn, .ant-tabs-tab-active');
+      const tab = nearestActiveTabLabel(el, 160);
       if (tab) chain.push({ kind: 'tab', label: tab });
-      const panel = nearestText(el, '.ant-collapse-header');
+      const panel = nearestPanelHeaderLabel(el, 160);
       if (panel) chain.push({ kind: 'panel', label: panel });
       const rowUrl = nearestRowUrl(el);
       if (rowUrl) chain.push({ kind: 'rowUrl', value: sanitizeUrl(rowUrl) || rowUrl });
@@ -1719,6 +1875,73 @@
     } catch (_) {}
   }
 
+  // [v7.2] generic-слой поверх WAI-ARIA — работает на ЛЮБОМ сайте (MUI, Radix, react-select,
+  // самописные компоненты), не только AntD. Запускается только если AntD-детектор выше не
+  // распознал паттерн (action.antd ещё не выставлен), чтобы не переобозначать дважды.
+  function annotateGenericAriaInteractions(t, action) {
+    if (!isElement(t) || !action || action.antd) return;
+    try {
+      const option = t.closest('[role="option"]');
+      if (option) {
+        const listbox = option.closest('[role="listbox"]');
+        const listboxId = listbox && listbox.id;
+        const owner = listboxId ? document.querySelector(`[aria-owns="${listboxId}"],[aria-controls="${listboxId}"],[aria-activedescendant]`) : null;
+        const valueText = collapse(option.textContent || '', 160);
+        action.action = 'select';
+        action.value = valueText;
+        action.aria = { control: 'listbox-option', valueText };
+        if (owner) {
+          const loc = locatorInfo(owner);
+          if (loc) { action.locator = loc; action.locatorConfidence = locatorConfidence(loc); action.controlLocator = loc; }
+        }
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+
+      const sw = t.closest('[role="switch"]');
+      if (sw) {
+        const checked = sw.getAttribute('aria-checked') === 'true';
+        action.action = 'toggle';
+        action.checked = checked;
+        action.aria = { control: 'switch', checked };
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+
+      const tab = t.closest('[role="tab"]');
+      if (tab) {
+        action.aria = { control: 'tab', label: collapse(tab.textContent || '', 160), selected: tab.getAttribute('aria-selected') === 'true' };
+        return;
+      }
+
+      // дисклоужер/аккордеон/дерево — любой триггер с aria-expanded, если это сам кликнутый
+      // элемент управления, а не случайный контейнер с этим атрибутом где-то выше по дереву
+      const disclosure = safeMatches(t, '[aria-expanded]') ? t : t.closest('button[aria-expanded],[role="button"][aria-expanded],summary[aria-expanded],[role="tab"][aria-expanded]');
+      if (disclosure) {
+        const wasExpanded = disclosure.getAttribute('aria-expanded') === 'true';
+        action.action = 'expand';
+        action.aria = { control: 'disclosure', label: collapse(disclosure.textContent || '', 160), wasExpanded };
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+    } catch (_) {}
+  }
+
+  // [v7.2] эвристика "разрушительности": текст элемента/ближайшей кнопки-ссылки или её
+  // классы похожи на необратимое действие. Не завязано на конкретный сайт/дизайн-систему.
+  function computeDestructive(t, action) {
+    if (!isElement(t) || !action) return;
+    try {
+      const name = (action.locator && (action.locator.accessibleName || action.locator.text)) || (action.target && action.target.text) || '';
+      if (config.destructiveWordPattern.test(name)) { action.destructive = true; return; }
+      const control = t.closest('button,[role="button"],a,[role="menuitem"]') || t;
+      const cls = typeof control.className === 'string' ? control.className : '';
+      if (config.destructiveClassPattern.test(cls)) { action.destructive = true; return; }
+      const controlText = collapse(control.innerText || control.textContent || '', 160) || '';
+      if (config.destructiveWordPattern.test(controlText)) action.destructive = true;
+    } catch (_) {}
+  }
+
   // [5] popup: клик, открывающий новую вкладку
   function annotatePopup(url, popupWindow = null, via = 'window_open') {
     const last = lastInteractive();
@@ -1792,6 +2015,8 @@
       });
       const action = pushMacro({ action: 'click', ...macroTarget(t, ctx), button: e.button });
       annotateAntdInteractions(t, action);
+      annotateGenericAriaInteractions(t, action);
+      computeDestructive(t, action);
 
       try {
         const anchor = t.closest('a');
@@ -2310,6 +2535,12 @@
     lastKnownUrl = newUrl;
     lastTitle = newTitle;
     saveBackup(true);
+    // [v7.2] первая SPA-навигация часто открывает совсем другой раздел приложения —
+    // стоит один раз пересканировать test-id атрибуты на свежем DOM
+    if (!idAttributeDiscoveryRanAfterNav) {
+      idAttributeDiscoveryRanAfterNav = true;
+      setTimeout(runIdAttributeDiscovery, 800);
+    }
   }
 
   history.pushState = function () {
@@ -2455,8 +2686,8 @@
     try { return String(input); } catch (_) { return null; }
   }
 
-  function requestBodyOf(input, init, url) {
-    const force = isAllowlistedForBody(url);
+  function requestBodyOf(input, init, url, actionId) {
+    const force = shouldCaptureBody(url, { actionId });
     if (init && init.body != null) return sanitizeBody(init.body, force);
     if (!config.captureNetworkBodies && !force) return input && typeof input.clone === 'function' ? '[BODY_NOT_CAPTURED]' : null;
     if (input && typeof input.clone === 'function' && input.method && input.method !== 'GET') {
@@ -2516,7 +2747,7 @@
         const requestId = `r-${++requestSeq}`;
         const correlated = currentActionForCorrelation(config.networkCorrelationMs);
         const actionId = correlated ? correlated.id : null;
-        const body = requestBodyOf(input, init, url);
+        const body = requestBodyOf(input, init, url, actionId);
 
         pushRaw({ kind: 'network', type: 'fetch_start', requestId, actionId, requestUrl: url, method, body });
         pushNetwork({ phase: 'start', transport: 'fetch', requestId, requestUrl: url, method, body }, actionId);
@@ -2527,7 +2758,8 @@
             requestUrl: url, finalUrl: sanitizeUrl(res.url), method,
             status: res.status, ok: res.ok, durationMs: Date.now() - start
           };
-          const allow = isAllowlistedForBody(url) || isAllowlistedForBody(res.url);
+          const allow = shouldCaptureBody(url, { actionId, status: res.status, ok: res.ok })
+            || shouldCaptureBody(res.url, { actionId, status: res.status, ok: res.ok });
 
           if (!config.captureResponseBodies && !allow) {
             pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...base });
@@ -2571,16 +2803,18 @@
         meta.requestId = `r-${++requestSeq}`;
         const correlated = currentActionForCorrelation(config.networkCorrelationMs);
         meta.actionId = correlated ? correlated.id : null;
-        const allow = isAllowlistedForBody(meta.url);
-        const requestBody = sanitizeBody(body, allow);
+        const allowRequest = shouldCaptureBody(meta.url, { actionId: meta.actionId });
+        const requestBody = sanitizeBody(body, allowRequest);
         pushRaw({ kind: 'network', type: 'xhr_start', requestId: meta.requestId, actionId: meta.actionId, requestUrl: meta.url, method: meta.method, body: requestBody });
         pushNetwork({ phase: 'start', transport: 'xhr', requestId: meta.requestId, requestUrl: meta.url, method: meta.method, body: requestBody }, meta.actionId);
 
         this.addEventListener('loadend', () => {
+          const ok = this.status >= 200 && this.status < 400;
+          const allow = allowRequest || shouldCaptureBody(meta.url, { actionId: meta.actionId, status: this.status, ok });
           const base = {
             phase: 'end', transport: 'xhr', requestId: meta.requestId,
             requestUrl: meta.url, finalUrl: sanitizeUrl(this.responseURL), method: meta.method,
-            status: this.status, ok: this.status >= 200 && this.status < 400, durationMs: Date.now() - meta.start
+            status: this.status, ok, durationMs: Date.now() - meta.start
           };
           if (config.captureResponseBodies || allow) {
             try { if (!this.responseType || this.responseType === 'text') base.responsePreview = truncBytes(this.responseText, allow ? config.bodyCaptureAllowlistMaxBytes : config.maxText); } catch (_) {}
@@ -2788,6 +3022,52 @@
     return warnings;
   }
 
+  // [v7.2] Собирает "что нужно уточнить у оператора" автоматически, по фактам записи —
+  // цель в том, чтобы получателю (ассистенту, пишущему скрипт автоматизации) не пришлось
+  // руками искать слабые места по всему таймлайну на каждую присланную запись.
+  function buildOpenQuestions(actions) {
+    const out = [];
+    for (const a of actions) {
+      const hasHuman = !!((a.humanExpected && a.humanExpected.length) || (a.humanNotes && a.humanNotes.length));
+
+      if (a.locatorConfidence && a.locatorConfidence.level === 'low' && !hasHuman) {
+        out.push({
+          type: 'weak_locator_unconfirmed', actionId: a.id, order: a.order,
+          question: `Шаг ${a.order} (${a.action}): локатор не подтверждён уникальным (${a.locator && a.locator.primary && a.locator.primary.css}). Это точно тот элемент?`
+        });
+      }
+      if (a.requiresManualVerification && !hasHuman) {
+        out.push({
+          type: 'manual_verification_missing', actionId: a.id, order: a.order,
+          question: `Шаг ${a.order} открыл вкладку/попап, результат не проверен автоматически — что там должно было появиться?`
+        });
+      }
+      if (a.possibleRetry) {
+        out.push({
+          type: 'possible_retry', actionId: a.id, order: a.order,
+          question: `Шаг ${a.order} повторяет клик по тому же элементу, что и шаг #${a.possibleRetry.previousActionId} без видимого эффекта между ними — нужен явный wait перед этим шагом?`
+        });
+      }
+      if (a.destructive && a.diff && !a.diff.fingerprintChanged && !(a.diff.inputs && a.diff.inputs.changed && a.diff.inputs.changed.length)) {
+        out.push({
+          type: 'destructive_no_visible_effect', actionId: a.id, order: a.order,
+          question: `Шаг ${a.order} похож на разрушительное действие, но видимых изменений на экране не зафиксировано — он реально сработал (может, было доп. подтверждение вне записи)?`
+        });
+      }
+      if (a.effects && a.effects.network) {
+        for (const n of a.effects.network) {
+          if (n.phase === 'end' && n.status >= 400 && !hasHuman) {
+            out.push({
+              type: 'network_error_unconfirmed', actionId: a.id, order: a.order,
+              question: `Шаг ${a.order} вызвал ${n.method} ${n.requestUrl} -> ${n.status}. Это ожидаемая ошибка сценария или сбой?`
+            });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
   function actionHuman(a) {
     const name = a.locator && (a.locator.accessibleName || a.locator.ariaLabel || a.locator.text) || a.target && a.target.text || a.target && a.target.tag || '';
     switch (a.action) {
@@ -2858,12 +3138,13 @@
     for (const a of macroLog) if (a) a.inferredExpected = deriveExpected(a);
   }
 
-  function exportBundle(filename = `action-log-v7-${Date.now()}.json`) {
+  function exportBundle(filename = `action-log-v7-${resolvedMacroName()}-${Date.now()}.json`) {
     finalizeAllActions();
     saveBackup(true);
     const actions = macroLog.map(cleanActionForExport);
     const variables = buildVariables(actions);
     const warnings = buildWarnings(actions);
+    const openQuestions = buildOpenQuestions(actions);
     const screens = dedupScreens(actions);
     const payload = {
       schema: 'action-logger-ai-v7',
@@ -2880,6 +3161,7 @@
         screenSnapshotsDeduped: screens.length,
         networkEntries: networkLog.length,
         weakLocators: actions.filter(a => a.locatorConfidence && a.locatorConfidence.level === 'low').length,
+        openQuestions: openQuestions.length,
         backupMode
       },
       aiInstructions: {
@@ -2889,12 +3171,14 @@
         useBeforeAfterAndEffectsToInferWaitsAndAssertions: true,
         secrets: 'Values marked REDACTED must be parameterized, never guessed',
         locatorRule: 'Prefer high-confidence semantic/test-id locators; low-confidence locators require repair instead of blindly using .first()',
-        popupRule: 'pageId separates browser pages when observable; target=_blank may be recorded but not instrumented by a one-shot page script'
+        popupRule: 'pageId separates browser pages when observable; target=_blank may be recorded but not instrumented by a one-shot page script',
+        openQuestionsRule: 'Resolve openQuestions[] with the user in one batch before writing automation for the affected steps — do not guess destructive/ambiguous steps silently'
       },
       timeline: actions,
       tasks: tasksLog,
       variables,
       warnings,
+      openQuestions,
       screens,
       network: networkLog,
       rawLog,
@@ -2905,10 +3189,13 @@
     };
     deliver(filename, JSON.stringify(payload, null, 2));
     console.log(`[logger] AI bundle: ${rawLog.length} raw / ${actions.length} actions / ${networkLog.length} network / ${screenLog.length} screens`);
+    if (openQuestions.length) {
+      console.log(`%c[logger] ${openQuestions.length} открытых вопросов — см. payload.openQuestions`, 'color:orange');
+    }
     return payload;
   }
 
-  function exportMacro(filename = `macro-log-v7-${Date.now()}.json`) {
+  function exportMacro(filename = `macro-log-v7-${resolvedMacroName()}-${Date.now()}.json`) {
     flushAllInputs();
     saveBackup(true);
     const payload = {
@@ -2944,6 +3231,9 @@
       textDiff: a.textDiff || null,
       checked: a.checked,
       antd: a.antd || null,
+      aria: a.aria || null,
+      destructive: !!a.destructive,
+      possibleRetry: a.possibleRetry || null,
       requiresManualVerification: a.requiresManualVerification || false,
       artifacts: (a.artifacts || []).map(x => ({ name: x.name, size: x.size, contentHash: x.contentHash || null, contentCaptured: !!x.contentCaptured })),
       network: (a.effects && a.effects.network || []).filter(n => n.phase !== 'start').map(n => ({ method: n.method, url: n.requestUrl, status: n.status, hasBody: n.responsePreview != null })),
@@ -2961,19 +3251,20 @@
     }));
   }
 
-  function exportPlan(filename = `action-plan-v7-${Date.now()}.json`) {
+  function exportPlan(filename = `action-plan-v7-${resolvedMacroName()}-${Date.now()}.json`) {
     finalizeAllActions();
     const actions = macroLog.map(cleanActionForExport);
     const payload = {
       schema: 'action-logger-plan-v7',
       version: VERSION,
       exportedAt: new Date().toISOString(),
-      session: { id: session.id, startUrl: session.startUrl, startedAt: session.startedAt },
+      session: { id: session.id, macroName: resolvedMacroName(), startUrl: session.startUrl, startedAt: session.startedAt },
       tasks: tasksLog,
+      openQuestions: buildOpenQuestions(actions),
       steps: buildPlan(actions)
     };
     deliver(filename, JSON.stringify(payload, null, 2));
-    console.log(`[logger] plan: ${payload.steps.length} шагов`);
+    console.log(`[logger] plan: ${payload.steps.length} шагов, ${payload.openQuestions.length} открытых вопросов`);
     return payload;
   }
 
@@ -3091,9 +3382,10 @@
         }
         break;
       case 'select':
-        if (a.antd && a.antd.control === 'select') {
-          // [v7.1] AntD Select — не нативный <select>, .selectOption() тут не работает:
-          // открываем дропдаун кликом по контролу и кликаем нужную опцию по тексту.
+        if ((a.antd && a.antd.control === 'select') || (a.aria && a.aria.control === 'listbox-option')) {
+          // [v7.1/v7.2] кастомный select (AntD или generic ARIA listbox) — не нативный
+          // <select>, .selectOption() тут не работает: открываем дропдаун кликом по
+          // контролу и кликаем нужную опцию по тексту.
           if (sel) push(`await ${sel}.click();`);
           push(`await page.getByRole('option', ${jsOptions({ name: a.value, exact: true })}).click();`);
         } else if (sel) {
@@ -3224,7 +3516,7 @@
     return lines.join('\n');
   }
 
-  function exportPlaywright(filename = `macro-playwright-v7-${Date.now()}.spec.js`) {
+  function exportPlaywright(filename = `macro-playwright-v7-${resolvedMacroName()}-${Date.now()}.spec.js`) {
     deliver(filename, generatePlaywright(), 'text/javascript');
     console.log(`[logger] Playwright: ${macroLog.length} действий`);
   }
@@ -3445,6 +3737,29 @@
     console.log('[logger] очищено');
   }
 
+  // [v7.2] Раз одна и та же утилита пишет макросы для разных задач/сайтов, файлы нужно
+  // различать без открытия каждого — по умолчанию имя берётся из пути страницы, но лучше
+  // явно задать __logger.setMacroName('add-js-asset') в начале записи.
+  function slugify(s, fallback) {
+    const x = String(s || '').toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+    return x || fallback || 'session';
+  }
+
+  function defaultMacroName() {
+    try { return slugify(new URL(session.startUrl).pathname, 'session'); }
+    catch (_) { return 'session'; }
+  }
+
+  function resolvedMacroName() {
+    return slugify(session.macroName || defaultMacroName(), 'session');
+  }
+
+  function setMacroName(name) {
+    session.macroName = name ? String(name).trim() : null;
+    saveBackup(true);
+    console.log(`%c[logger] имя макроса: ${resolvedMacroName()}`, 'color:cyan');
+  }
+
   function mark(label) {
     const text = trunc(String(label), 200);
     pushRaw({ kind: 'mark', type: 'mark', label: text });
@@ -3567,6 +3882,7 @@
   }
 
   whenBodyReady(buildPanel);
+  whenBodyReady(() => setTimeout(runIdAttributeDiscovery, 1200)); // даём странице отрендериться
 
   window.__logger = {
     version: VERSION,
@@ -3585,6 +3901,7 @@
     beginTask,
     endTask,
     tasksLog,
+    setMacroName,
     expect: expectFact,
     note,
     registerProbe(name, fn) {
@@ -3601,6 +3918,21 @@
       config.mutationRoot = selector || null;
       attachMutationObservers();
       console.log(`[logger] mutation root: ${selector || 'document.documentElement'}`);
+    },
+    // [v7.2] тела запросов и без этого сохраняются для всего, что коррелирует с действием,
+    // или для ошибок — это только ручной override сверху общего правила (фоновые запросы,
+    // не привязанные ни к одному клику, но всё равно важные конкретно для вашего сайта)
+    captureBodiesFor(pattern) {
+      if (!pattern) return;
+      if (!config.bodyCaptureAllowlist.includes(pattern)) config.bodyCaptureAllowlist.push(pattern);
+      console.log(`[logger] тело запроса/ответа теперь всегда сохраняется для URL, содержащих: ${pattern}`);
+    },
+    rediscoverIdAttributes: runIdAttributeDiscovery,
+    setTestIdAttribute(name) {
+      if (!name) return;
+      config.testIdAttribute = name;
+      config.testIdAttributeManuallySet = true;
+      console.log(`[logger] testIdAttribute вручную установлен: ${name}`);
     },
     export: exportBundle,
     exportAI: exportBundle,
