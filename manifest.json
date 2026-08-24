@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Action Logger v7.2 — Macro Recorder",
+  "version": "7.2.0",
+  "description": "Auto-attaches action-logger-v7.js at document_start on the sites you list in matches, so a recording session survives full page reloads instead of requiring a fresh DevTools console paste after every navigation.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://REPLACE-WITH-A-SITE-YOU-RECORD-MACROS-ON.example/*"
+      ],
+      "js": ["action-logger-v7.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ]
+}

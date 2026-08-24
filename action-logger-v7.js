@@ -19,6 +19,59 @@
  * [12] отдельный lightweight MutationObserver для UI-effects работает даже в macro-режиме;
  * [13] сохранены Shadow DOM, iframe, dialogs, navigation, backup, CSP fallback и Playwright export v6.
  *
+ * v7.1 добавляет поверх v7 (нужно, чтобы по логу можно было реально доделать миграцию контента,
+ * а не только восстановить хореографию кликов):
+ *  [1] полный (не innerText!) текст CodeMirror 6 через node.cmView.view.state.doc.toString(),
+ *      плюс построчный diff между началом и концом серии debounce-вводов в одном поле;
+ *  [2] request/response тела всегда сохраняются для запросов, коррелированных с действием
+ *      пользователя (см. v7.2 [1] — правило с тех пор стало общим, без списка URL);
+ *  [3] содержимое загружаемых текстовых файлов (File.text()) с hash — не только name/size/type;
+ *  [4] семантика Ant Design: Select-опция из портала, Switch, Radio, Collapse-заголовок,
+ *      кнопки Popconfirm/Modal распознаются вместо безымянного "клик по div";
+ *  [5] contextChain на каждом действии — активная вкладка, заголовок раскрытой панели,
+ *      URL ассета из input в ближайшей строке;
+ *  [6] screenDiff сравнивает значения input/select и порядок повторяющихся строк, а не
+ *      только headings/dialogs/alerts/buttons;
+ *  [7] hover-проверки и UI-effects MutationObserver используют light-дескрипторы и исключают
+ *      поддеревья CodeMirror/тултипов — меньше принудительных reflow на каждый чих/нажатие;
+ *  [8] полный бэкап уходит в IndexedDB (structured clone) вместо JSON.stringify всего в
+ *      localStorage каждые 2.5с; localStorage хранит только компактную версию для быстрого
+ *      синхронного restore сразу после reload;
+ *  [9] fetch/XHR патчатся не только в top-window, но и в каждом same-origin iframe/popup;
+ * [10] unstableTokenPattern больше не бракует длинные стабильные классы (ant-collapse-header
+ *      и т.п.) — см. v7.2 [2] про автоопределение testIdAttribute на любом сайте;
+ * [11] __logger.registerProbe(name, fn) — предметный snapshot приложения до/после действия;
+ * [12] __logger.expect(...) / __logger.note(...) — человеческие ассерты/заметки в момент записи;
+ * [13] console.log/console.info тоже пишутся в raw log (кроме сообщений самого логгера);
+ * [14] реордер строк через pointer events (не только HTML5 DnD) распознаётся как dragTo;
+ * [15] __logger.beginTask(meta) / endTask(result) — группировка таймлайна по страницам/задачам;
+ * [16] экспорт дедуплицирует снапшоты по fingerprint (screens[] + ссылки вместо копий) и
+ *      добавляет __logger.exportPlan() — компактный JSON-рецепт без сырых снапшотов/тел сети;
+ * [17] клики по ссылке с target=_blank помечаются requiresManualVerification.
+ *
+ * v7.2 — инструмент больше не заточен под один конкретный сайт: то, что раньше требовало
+ * ручной настройки под SiteEditor, теперь определяется в рантайме на любой странице:
+ *  [1] bodyCaptureAllowlist (список URL) убран — общее правило "тело сохраняется для
+ *      любого запроса, коррелированного с действием пользователя, или для ошибки сети",
+ *      работает без знания конкретных эндпоинтов; __logger.captureBodiesFor(pattern) —
+ *      ручной override сверху для несвязанных с действиями запросов;
+ *  [2] discoverCustomIdAttributes() сканирует интерактивные элементы, находит частые
+ *      стабильные кастомные атрибуты (data-at-selector, data-qa-id, data-hook, ...) и сам
+ *      выбирает testIdAttribute — без знания разметки сайта заранее;
+ *  [3] generic ARIA-слой (role=option/listbox/switch/tab/[aria-expanded]) поверх
+ *      AntD-детектора — семантика Select/Switch/Collapse распознаётся и на не-AntD сайтах;
+ *      contextChain (активная вкладка/заголовок панели) починен — раньше el.closest() не
+ *      мог найти активный таб/заголовок, т.к. это соседи по DOM, а не предки;
+ *  [4] action.destructive — эвристика по тексту/классам (delete/remove/discard/danger...);
+ *  [5] action.possibleRetry — повтор клика по тому же локатору без видимого эффекта между
+ *      попытками — сигнал, что в скрипте нужен явный wait;
+ *  [6] __logger.setMacroName(name) — recording'и различаются по имени, а не только по id
+ *      сессии, если инструмент используется для многих разных сценариев/сайтов подряд;
+ *  [7] payload.openQuestions[] — автосборка "что уточнить у оператора" (слабые локаторы без
+ *      подтверждения, неинструментированные попапы, возможные retry, разрушительные шаги без
+ *      видимого эффекта, неподтверждённые сетевые ошибки) — готовый чек-лист, а не то, что
+ *      получателю нужно вычислять самому по всему таймлайну.
+ *
  * Команды:
  *   __logger.start() / pause() / stop() / destroy()
  *   __logger.stats() / clear()
@@ -26,12 +79,20 @@
  *   __logger.exportPlaywright()     // опционально, если нужен отдельный .spec.js
  *   __logger.generatePlaywright()
  *   __logger.copyLast()
+ *   __logger.registerProbe(name, fn) / unregisterProbe(name)
+ *   __logger.expect({ type, value }) / __logger.note(text)
+ *   __logger.beginTask({ locale, path }) / endTask({ status })
+ *   __logger.exportPlan()           // компактный JSON без сырых снапшотов/тел сети
+ *   __logger.setMacroName(name)     // имя для файлов экспорта при множестве записей
+ *   __logger.captureBodiesFor(pattern) / rediscoverIdAttributes() / setTestIdAttribute(name)
  */
 (function () {
   'use strict';
 
-  const VERSION = '7.0.0';
-  const STORAGE_KEY = '__actionLoggerBackup_v7';
+  const VERSION = '7.2.0';
+  const STORAGE_KEY = '__actionLoggerBackup_v7_2';
+  const IDB_NAME = '__actionLoggerBackupV7';
+  const IDB_STORE = 'backup';
 
   if (window.__logger && window.__logger.version === VERSION) {
     window.__logger.showPanel();
@@ -48,6 +109,8 @@
     prompt: window.prompt,
     consoleError: console.error,
     consoleWarn: console.warn,
+    consoleLog: console.log,
+    consoleInfo: console.info,
     pushState: history.pushState,
     replaceState: history.replaceState,
     xhrOpen: XMLHttpRequest.prototype.open,
@@ -60,14 +123,24 @@
     mode: 'macro', // macro | debug
 
     maxText: 1000,
+    // [v7.1] большой лимит для CodeMirror/textarea/contentEditable/URL — иначе главный
+    // артефакт миграции (текст EmbeddedHTML) обрезается до 1000 символов
+    maxLargeText: 100000,
     maxRawEvents: 12000,
     maxMacroActions: 3000,
     maxScreenSnapshots: 3500,
     maxNetworkEntries: 6000,
 
+    // [v7.2] сайт-специфичного списка URL больше нет — вместо него общее правило:
+    // тело всегда сохраняется для запроса, коррелированного с действием пользователя
+    // (actionId != null), или для любого запроса с ошибкой. Работает на любом сайте без
+    // настройки. Этот список — только ручной override сверху общего правила (пуст по умолчанию,
+    // пополняется через __logger.captureBodiesFor(pattern) для несвязанных с действиями запросов).
+    bodyCaptureAllowlist: [],
+    bodyCaptureAllowlistMaxBytes: 200000,
+
     // [7] бэкап по времени, а не по количеству событий
     autoSaveMs: 2500,
-    backupRawTail: 1500,
     autoRestore: true,
     autoExportOnStop: true,
 
@@ -80,6 +153,10 @@
     uiEffectsPerAction: 40,
     screenMaxItems: 40,
 
+    // [v7.1][16] отдельно от trackLowLevelMouse (debug-only диагностика) — реордер строк
+    // через pointer events (не HTML5 DnD) иначе не попадает в лог вообще
+    trackPointerDrag: true,
+    pointerDragThresholdPx: 8,
     trackLowLevelMouse: false,
     trackAllKeyboard: false,
     trackFocus: false,
@@ -103,7 +180,12 @@
     // [9][10] генерация теста
     playwrightTextMethod: 'fill', // fill | pressSequentially
     playwrightLocators: 'semantic', // semantic | css
+    // [v7.2] нейтральный дефолт по конвенции Playwright; на конкретном сайте переопределяется
+    // автоматически через discoverCustomIdAttributes() — см. ниже — без ручной настройки
     testIdAttribute: 'data-testid',
+    testIdAttributeManuallySet: false,
+    autoDiscoverTestIdAttribute: true,
+    discoveredIdAttributes: [], // заполняется discoverCustomIdAttributes() в рантайме
     emitAssertions: true,
     emitSteps: true,
 
@@ -120,6 +202,19 @@
       '[data-action-logger-internal]'
     ],
 
+    // [v7.1] поддеревья, которые исключаются из UI-effects MutationObserver (не из общего
+    // isIgnoredEl!) — CodeMirror перерисовывает десятки узлов на каждое нажатие клавиши,
+    // и раньше это заставляло watchActionEffects делать компактный дескриптор на каждый чих
+    mutationExcludeSelectors: [
+      '.cm-editor',
+      '.cm-scroller',
+      '.cm-content',
+      '.cm-gutters',
+      '.ant-spin',
+      '.ant-tooltip',
+      '[data-cds="Tooltip"]'
+    ],
+
     networkIgnore: [
       'doubleclick.net',
       'google-analytics',
@@ -131,7 +226,19 @@
     ],
 
     sensitiveNamePattern: /pass(word)?|pwd|secret|token|auth|authorization|cookie|session|csrf|api[-_]?key|access[-_]?key|private[-_]?key|credit|card|cvv|cvc|otp|pin/i,
-    unstableTokenPattern: /(^\d{4,}$)|([a-f0-9]{10,})|([A-Za-z0-9_-]{18,})|(^css-)|(^sc-)|(^jss)|(^Mui[A-Z].*-\d+$)|(^_[A-Za-z0-9]{7,}_)/i
+    // [v7.2] клики, похожие на необратимое действие — помечаются action.destructive=true,
+    // чтобы в сгенерированном скрипте такие шаги шли под подтверждение, а не выполнялись
+    // молча наравне с открытием вкладки. Общий по тексту/классам эвристический паттерн,
+    // не завязан на конкретный сайт.
+    destructiveWordPattern: /\b(delete|remove|discard|purge|destroy|reject|revoke|unpublish|drop)\b|удал|отклон|отказ|очистить всё|сбросить всё/i,
+    destructiveClassPattern: /danger|destructive|delete|remove|warn/i,
+    // [v7.1] классы/атрибуты с этими префиксами считаются стабильными независимо от длины —
+    // старое правило "18+ символов = нестабильно" браковало ant-collapse-header (19),
+    // ant-select-selection-item (25) и другие обычные классы дизайн-системы
+    stableTokenPrefixes: ['ant-', 'anticon-', 'data-at-'],
+    // убрана общая длина ([A-Za-z0-9_-]{18,}) — остались только реальные признаки
+    // сгенерированных/хешированных токенов (css-in-js, CSS modules, длинные hex-хеши)
+    unstableTokenPattern: /(^\d{4,}$)|([a-f0-9]{10,})|(^css-)|(^sc-)|(^jss)|(^Mui[A-Z].*-\d+$)|(^_[A-Za-z0-9]{7,}_)/i
   };
 
   // ------------------------------------------------------------------ utils
@@ -202,9 +309,21 @@
     return config.sensitiveNamePattern.test(hay);
   }
 
-  function sanitizeValue(el, value) {
+  // [v7.1] большие поля (CodeMirror/textarea/contentEditable/url) не режутся до 1000 символов
+  function fieldTextLimit(el) {
+    if (isCodeMirrorContent(el)) return config.maxLargeText;
+    if (isElement(el) && el.tagName === 'TEXTAREA') return config.maxLargeText;
+    if (isElement(el) && el.isContentEditable) return config.maxLargeText;
+    if (isElement(el)) {
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      if (type === 'url') return config.maxLargeText;
+    }
+    return config.maxText;
+  }
+
+  function sanitizeValue(el, value, limit) {
     if (isSensitiveElement(el)) return '[REDACTED]';
-    return trunc(value);
+    return trunc(value, limit || fieldTextLimit(el));
   }
 
   function sanitizeUrl(url) {
@@ -220,28 +339,53 @@
     }
   }
 
-  function sanitizeObject(value, depth = 0) {
+  function sanitizeObject(value, depth = 0, limit = config.maxText) {
     if (depth > 5) return '[MAX_DEPTH]';
     if (value == null) return value;
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return trunc(value);
-    if (Array.isArray(value)) return value.slice(0, 100).map(v => sanitizeObject(v, depth + 1));
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return trunc(value, limit);
+    if (Array.isArray(value)) return value.slice(0, 100).map(v => sanitizeObject(v, depth + 1, limit));
     if (typeof value === 'object') {
       const out = {};
       for (const [k, v] of Object.entries(value).slice(0, 100)) {
-        out[k] = config.sensitiveNamePattern.test(k) ? '[REDACTED]' : sanitizeObject(v, depth + 1);
+        out[k] = config.sensitiveNamePattern.test(k) ? '[REDACTED]' : sanitizeObject(v, depth + 1, limit);
       }
       return out;
     }
-    return trunc(String(value));
+    return trunc(String(value), limit);
   }
 
-  function sanitizeBody(body) {
+  // [v7.1] truncBytes использует ту же посимвольную оценку, что и trunc — для JSON-текста
+  // этого достаточно, без реального подсчёта UTF-8 байт
+  function truncBytes(value, limit) {
+    return trunc(value, limit);
+  }
+
+  // [v7.2] сайт-специфичного списка URL больше нет. Общее, работающее на любом сайте правило:
+  // тело сохраняется всегда для запроса, который вызвало действие пользователя (actionId
+  // известен — почти всегда это то, что реально доказывает результат шага), для любой ошибки
+  // сети (диагностика), и для URL из ручного override-списка (__logger.captureBodiesFor()).
+  function isAllowlistedForBody(url) {
+    return !!url && config.bodyCaptureAllowlist.some(p => String(url).includes(p));
+  }
+
+  function shouldCaptureBody(url, meta) {
+    meta = meta || {};
+    if (isAllowlistedForBody(url)) return true;
+    if (meta.actionId) return true;
+    if (meta.status != null && meta.status >= 400) return true;
+    if (meta.ok === false) return true;
+    return false;
+  }
+
+  // forceCapture=true игнорирует captureNetworkBodies и использует bodyCaptureAllowlistMaxBytes
+  function sanitizeBody(body, forceCapture = false) {
     if (body == null) return null;
-    if (!config.captureNetworkBodies) return '[BODY_NOT_CAPTURED]';
+    if (!config.captureNetworkBodies && !forceCapture) return '[BODY_NOT_CAPTURED]';
+    const limit = forceCapture ? config.bodyCaptureAllowlistMaxBytes : config.maxText;
     try {
       if (body instanceof URLSearchParams) {
         const out = {};
-        for (const [k, v] of body.entries()) out[k] = config.sensitiveNamePattern.test(k) ? '[REDACTED]' : trunc(v);
+        for (const [k, v] of body.entries()) out[k] = config.sensitiveNamePattern.test(k) ? '[REDACTED]' : trunc(v, limit);
         return out;
       }
       if (body instanceof FormData) {
@@ -249,25 +393,81 @@
         for (const [k, v] of body.entries()) {
           if (config.sensitiveNamePattern.test(k)) out[k] = '[REDACTED]';
           else if (v instanceof File) out[k] = { file: v.name, size: v.size, type: v.type };
-          else out[k] = trunc(v);
+          else out[k] = trunc(v, limit);
         }
         return out;
       }
       if (typeof body === 'string') {
         try {
-          return sanitizeObject(JSON.parse(body));
+          return sanitizeObject(JSON.parse(body), 0, limit);
         } catch (_) {
-          return trunc(body);
+          return trunc(body, limit);
         }
       }
-      return sanitizeObject(body);
+      return sanitizeObject(body, 0, limit);
     } catch (_) {
       return '[UNREADABLE_BODY]';
     }
   }
 
   function stableToken(token) {
-    return !!token && !config.unstableTokenPattern.test(String(token));
+    if (!token) return false;
+    const s = String(token);
+    if (config.stableTokenPrefixes.some(p => s.startsWith(p))) return true;
+    return !config.unstableTokenPattern.test(s);
+  }
+
+  // [v7.2] "пусть сам узнает всё о сайте": вместо жёстко зашитого имени test-id атрибута
+  // сканируем интерактивные элементы и ищем часто повторяющиеся кастомные атрибуты со
+  // стабильными (не хэш-подобными) значениями — именно так выглядит QA/test-id атрибут,
+  // каким бы именем его ни назвали на конкретном сайте (data-at-selector, data-qa-id,
+  // data-cy-id, data-auto, data-hook, ...).
+  const COMMON_HTML_ATTRS = new Set([
+    'id', 'class', 'style', 'type', 'name', 'href', 'src', 'role', 'tabindex', 'disabled',
+    'checked', 'readonly', 'placeholder', 'value', 'title', 'alt', 'target', 'rel', 'for',
+    'action', 'method', 'width', 'height', 'colspan', 'rowspan', 'draggable', 'contenteditable',
+    'spellcheck', 'autocomplete', 'maxlength', 'minlength', 'min', 'max', 'step', 'pattern',
+    'required', 'multiple', 'selected', 'size', 'accept', 'autofocus', 'autoplay', 'controls',
+    'loop', 'muted', 'download', 'lang', 'dir', 'translate', 'hidden', 'inert', 'nonce',
+    'crossorigin', 'referrerpolicy', 'sandbox', 'allow', 'loading', 'decoding', 'sizes', 'srcset'
+  ]);
+
+  function discoverCustomIdAttributes(doc = document) {
+    try {
+      const freq = new Map();
+      const candidates = doc.querySelectorAll('button,a,input,select,textarea,[role],[onclick],[tabindex]');
+      let scanned = 0;
+      for (const el of candidates) {
+        if (++scanned > 4000) break;
+        const names = el.getAttributeNames ? el.getAttributeNames() : [];
+        for (const name of names) {
+          if (COMMON_HTML_ATTRS.has(name) || name.startsWith('aria-') || name.startsWith('on') || name.startsWith('data-v-') || name.startsWith('data-react')) continue;
+          const value = el.getAttribute(name);
+          if (!value || value.length > 100 || !stableToken(value)) continue;
+          freq.set(name, (freq.get(name) || 0) + 1);
+        }
+      }
+      return [...freq.entries()]
+        .filter(([, count]) => count >= 3)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([name]) => name);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function runIdAttributeDiscovery() {
+    if (!config.autoDiscoverTestIdAttribute) return;
+    const found = discoverCustomIdAttributes(document);
+    if (!found.length) return;
+    config.discoveredIdAttributes = found;
+    // getByTestId в сгенерированном Playwright может проверять только ОДНО имя атрибута —
+    // берём самый частый кандидат, если пользователь явно не переопределил testIdAttribute
+    if (!config.testIdAttributeManuallySet) {
+      config.testIdAttribute = found[0];
+    }
+    console.log(`%c[logger] обнаружены вероятные test-id атрибуты сайта: ${found.join(', ')} (используется: ${config.testIdAttribute})`, 'color:lime');
   }
 
   // ------------------------------------------------ [1] shadow-aware локаторы
@@ -467,7 +667,11 @@
     const tag = el.tagName.toLowerCase();
     const candidates = [];
 
-    for (const attr of ['data-testid', 'data-test', 'data-qa', 'data-cy']) {
+    // [v7.2] config.discoveredIdAttributes заполняется discoverCustomIdAttributes() —
+    // это позволяет находить стабильные test-id-подобные атрибуты на ЛЮБОМ сайте, а не
+    // только по фиксированному списку общеизвестных имён
+    const testIdAttrs = new Set([config.testIdAttribute, ...config.discoveredIdAttributes, 'data-at-selector', 'data-testid', 'data-test', 'data-qa', 'data-cy']);
+    for (const attr of testIdAttrs) {
       const value = el.getAttribute(attr);
       if (value && stableToken(value)) {
         const css = `[${attr}="${quoteAttr(value)}"]`;
@@ -633,9 +837,24 @@
     return out;
   }
 
+  // [v7.1][9] locatorInfo делает 5-7 querySelectorAll на элемент — компактный дескриптор
+  // кэшируется по элементу на время ОДНОГО screenSnapshot()-вызова (generation-инвалидация,
+  // не переживает следующий снапшот, т.к. уникальность локатора могла измениться).
+  let locatorCacheGen = 0;
+  const locatorCache = new WeakMap();
+
+  function locatorInfoCached(el) {
+    if (!isElement(el)) return null;
+    const hit = locatorCache.get(el);
+    if (hit && hit.gen === locatorCacheGen) return hit.value;
+    const value = locatorInfo(el);
+    locatorCache.set(el, { gen: locatorCacheGen, value });
+    return value;
+  }
+
   function compactElement(el) {
     if (!isElement(el)) return null;
-    const loc = locatorInfo(el);
+    const loc = locatorInfoCached(el);
     return {
       tag: el.tagName.toLowerCase(),
       role: roleOf(el),
@@ -648,35 +867,61 @@
     };
   }
 
-  function screenSnapshot(doc = document, ctx = null) {
+  // [9] лёгкий дескриптор без locatorInfo/rect/computedStyle — не форсирует reflow.
+  // Используется только для дешёвого "изменился ли экран" при hover-проверках; если
+  // изменение подтвердилось, финальные before/after всё равно строятся полными.
+  function compactElementLight(el) {
+    if (!isElement(el)) return null;
+    return {
+      tag: el.tagName.toLowerCase(),
+      role: roleOf(el),
+      name: accessibleName(el),
+      text: collapse(el.innerText || el.textContent || '', 220) || null,
+      type: el.getAttribute('type'),
+      placeholder: null,
+      href: null,
+      locator: null
+    };
+  }
+
+  function screenSnapshot(doc = document, ctx = null, opts = null) {
     if (!config.captureScreenSnapshots || !doc) return null;
+    const light = !!(opts && opts.light);
+    if (!light) locatorCacheGen++;
+    const compact = light ? compactElementLight : compactElement;
     const win = doc.defaultView || window;
     const c = ctx || ctxFor(doc);
     const headings = visibleElements(doc, 'h1,h2,h3,[role="heading"]')
       .map(el => collapse(el.innerText || el.textContent || '', 220)).filter(Boolean);
-    const dialogs = visibleElements(doc, 'dialog,[role="dialog"],[aria-modal="true"]', 15).map(compactElement).filter(Boolean);
-    const alerts = visibleElements(doc, '[role="alert"],[role="status"],[aria-live]', 20).map(compactElement).filter(Boolean);
+    const dialogs = visibleElements(doc, 'dialog,[role="dialog"],[aria-modal="true"]', 15).map(compact).filter(Boolean);
+    const alerts = visibleElements(doc, '[role="alert"],[role="status"],[aria-live]', 20).map(compact).filter(Boolean);
     const buttons = visibleElements(doc, 'button,[role="button"],input[type="button"],input[type="submit"]')
-      .map(compactElement).filter(Boolean);
-    const inputs = visibleElements(doc, 'input,textarea,select,[contenteditable="true"]')
+      .map(compact).filter(Boolean);
+    const inputs = light ? [] : visibleElements(doc, 'input,textarea,select,[contenteditable="true"]')
       .map(el => {
-        const x = compactElement(el);
+        const x = compact(el);
         if (!x) return null;
-        x.value = 'value' in el ? sanitizeValue(el, el.value) : sanitizeValue(el, el.textContent || '');
+        // [v7.1] rawEditableValue достаёт полный текст CodeMirror 6 (не innerText — тот
+        // отдаёт только видимую из-за виртуализации строк часть), поэтому before/after
+        // снапшоты редактора реально отражают контент, а не обрезанный фрагмент экрана
+        const sensitive = isSensitiveElement(el);
+        const raw = rawEditableValue(el);
+        x.value = sensitive ? '[REDACTED]' : trunc(raw, fieldTextLimit(el));
+        x.valueHash = sensitive ? null : simpleHash(raw);
         if (el.tagName === 'SELECT') x.selectedText = uniqueStrings(Array.from(el.selectedOptions || []).map(o => o.text), 10);
         return x;
       }).filter(Boolean);
-    const tables = visibleElements(doc, 'table,[role="grid"],[role="table"]', 12).map(el => {
+    const tables = light ? [] : visibleElements(doc, 'table,[role="grid"],[role="table"]', 12).map(el => {
       let headers = [];
       let rowCount = null;
       try {
         headers = uniqueStrings(Array.from(el.querySelectorAll('th,[role="columnheader"]')).map(x => x.innerText || x.textContent), 20);
         rowCount = el.querySelectorAll('tbody tr,[role="row"]').length;
       } catch (_) {}
-      return { locator: locatorInfo(el), headers, rowCount, textPreview: collapse(el.innerText || el.textContent || '', 500) };
+      return { locator: locatorInfoCached(el), headers, rowCount, textPreview: collapse(el.innerText || el.textContent || '', 500) };
     });
     let activeElement = null;
-    try { activeElement = compactElement(doc.activeElement); } catch (_) {}
+    if (!light) { try { activeElement = compact(doc.activeElement); } catch (_) {} }
     const snapshot = {
       pageId: c.pageId || 'page-1',
       frame: c.label || 'top',
@@ -692,7 +937,8 @@
       activeElement,
       scroll: { x: Math.round(win.scrollX || 0), y: Math.round(win.scrollY || 0) },
       viewport: { width: win.innerWidth || null, height: win.innerHeight || null },
-      capturedAt: new Date().toISOString()
+      capturedAt: new Date().toISOString(),
+      light
     };
     snapshot.fingerprint = simpleHash(JSON.stringify({
       url: snapshot.url, title: snapshot.title, headings: snapshot.headings,
@@ -755,6 +1001,44 @@
         removed: [...A.entries()].filter(([k]) => !B.has(k)).map(([,v]) => v)
       };
     };
+
+    // [v7.1][8] раньше diff смотрел только на headings/dialogs/alerts/buttons — для Assets
+    // единственное, что реально меняется, это значения input/select и порядок строк.
+    const inputKey = x => (x && x.locator && x.locator.primary && x.locator.primary.css) || descriptorKey(x);
+    const diffInputs = (a, b) => {
+      const A = keyedList(a, inputKey), B = keyedList(b, inputKey);
+      const changed = [];
+      for (const [k, bv] of B.entries()) {
+        const av = A.get(k);
+        if (!av) continue;
+        // valueHash сравнивает ПОЛНЫЙ контент (важно для CM6: truncated value может
+        // случайно совпасть по первым maxLargeText символам, hash — нет)
+        const valueChanged = (av.valueHash != null && bv.valueHash != null)
+          ? av.valueHash !== bv.valueHash
+          : av.value !== bv.value;
+        const selectedChanged = JSON.stringify(av.selectedText || null) !== JSON.stringify(bv.selectedText || null);
+        if (valueChanged || selectedChanged) {
+          changed.push({
+            locator: bv.locator, name: bv.name, text: bv.text,
+            from: av.value, to: bv.value,
+            fromHash: av.valueHash || null, toHash: bv.valueHash || null,
+            fromSelected: av.selectedText || null, toSelected: bv.selectedText || null
+          });
+        }
+      }
+      return {
+        added: [...B.entries()].filter(([k]) => !A.has(k)).map(([,v]) => v),
+        removed: [...A.entries()].filter(([k]) => !B.has(k)).map(([,v]) => v),
+        changed
+      };
+    };
+    const rowOrder = list => (list || []).map(inputKey).filter(Boolean);
+    const beforeOrder = rowOrder(before.inputs);
+    const afterOrder = rowOrder(after.inputs);
+    const commonBefore = beforeOrder.filter(k => afterOrder.includes(k));
+    const commonAfter = afterOrder.filter(k => beforeOrder.includes(k));
+    const inputsOrderChanged = commonBefore.length > 1 && JSON.stringify(commonBefore) !== JSON.stringify(commonAfter);
+
     return {
       urlChanged: before.url !== after.url ? { from: before.url, to: after.url } : null,
       titleChanged: before.title !== after.title ? { from: before.title, to: after.title } : null,
@@ -762,12 +1046,25 @@
       headings: diffStrings(before.headings, after.headings),
       dialogs: diffObjects(before.dialogs, after.dialogs),
       alerts: diffObjects(before.alerts, after.alerts),
-      buttons: diffObjects(before.buttons, after.buttons)
+      buttons: diffObjects(before.buttons, after.buttons),
+      inputs: diffInputs(before.inputs, after.inputs),
+      inputsOrderChanged
     };
   }
 
+  // [v7.1][9] CodeMirror перерисовывает десятки узлов на каждое нажатие клавиши — без
+  // этого исключения watchActionEffects дергает compactElement/querySelector на каждый чих,
+  // что при печати в редакторе превращается в шквал принудительных reflow.
+  function isMutationExcluded(el) {
+    if (!isElement(el)) return false;
+    for (const sel of config.mutationExcludeSelectors) {
+      try { if (el.closest(sel)) return true; } catch (_) {}
+    }
+    return false;
+  }
+
   function meaningfulMutationNode(node) {
-    if (!isElement(node) || isIgnoredEl(node)) return null;
+    if (!isElement(node) || isIgnoredEl(node) || isMutationExcluded(node)) return null;
     const interesting = safeMatches(node, 'dialog,[role="dialog"],[role="alert"],[role="status"],[aria-live],h1,h2,h3,button,[role="button"],table,[role="grid"],form,[class*="toast" i],[class*="modal" i],[class*="alert" i],[class*="success" i],[class*="error" i]')
       ? node
       : (node.querySelector ? node.querySelector('dialog,[role="dialog"],[role="alert"],[role="status"],[aria-live],h1,h2,h3,[class*="toast" i],[class*="modal" i],[class*="alert" i]') : null);
@@ -820,19 +1117,25 @@
     startedAt: new Date().toISOString(),
     startUrl: location.href,
     startTitle: document.title,
+    macroName: null, // [v7.2] __logger.setMacroName(...) — иначе выводится из pathname при экспорте
     env: environment()
   };
   if (!session.env) session.env = environment();
+  if (session.macroName === undefined) session.macroName = null;
 
   const rawLog = restored && Array.isArray(restored.rawLog) ? restored.rawLog : [];
   const macroLog = restored && Array.isArray(restored.macroLog) ? restored.macroLog : [];
   const screenLog = restored && Array.isArray(restored.screenLog) ? restored.screenLog : [];
   const networkLog = restored && Array.isArray(restored.networkLog) ? restored.networkLog : [];
+  // [v7.1][19] группировка по страницам/задачам — плоский таймлайн на 20 страниц читать
+  // бесполезно, а per-page рецепт с фактическими значениями это то, из чего пишется код.
+  const tasksLog = restored && Array.isArray(restored.tasksLog) ? restored.tasksLog : [];
 
   window.__actionLog = rawLog;
   window.__macroLog = macroLog;
   window.__screenLog = screenLog;
   window.__networkLog = networkLog;
+  window.__tasksLog = tasksLog;
 
   let recording = true;
   let rawSeq = rawLog.length ? Math.max(...rawLog.map(x => Number(x.seq) || 0)) + 1 : 0;
@@ -843,6 +1146,8 @@
   let pageSeq = restored && restored.pageSeq ? restored.pageSeq : 1;
   let requestSeq = restored && restored.requestSeq ? restored.requestSeq : 0;
   let currentAction = null;
+  let currentTask = restored && restored.currentTask ? restored.currentTask : null; // [v7.1][19]
+  let idAttributeDiscoveryRanAfterNav = false; // [v7.2]
   const actionsById = new Map();
   for (const a of macroLog) if (a && a.id) actionsById.set(a.id, a);
   let actionFinalizeTimer = null;
@@ -857,45 +1162,113 @@
     finally { internalDepth--; }
   }
 
-  // ----------------------------------------------- [7] бэкап c деградацией
+  // ----------------------------------------------- [7][v7.1][10] бэкап c деградацией
+  //
+  // localStorage-only бэкап раньше JSON.stringify'ил macroLog + 300 снапшотов + 500 network
+  // записей каждые 2.5с — на часовой сессии это мегабайты стрингификации на каждом тике и
+  // почти гарантированный выход за квоту localStorage (5-10MB), после чего терялись как раз
+  // rawLog/screenLog/networkLog. Теперь: ПОЛНЫЙ бэкап (structured clone, без stringify) идёт
+  // в IndexedDB — там квота на порядки больше; localStorage хранит только компактную версию
+  // (session + macroLog, большие текстовые поля обрезаны для самого бэкапа) для быстрого
+  // синхронного восстановления сразу после reload, ещё до того как откроется IndexedDB.
 
   let saveTimer = null;
   let backupMode = 'full'; // full | macro-only | off
+  let idbHandle = null;
+  let idbFailed = false;
 
-  function backupPayload() {
-    const base = {
+  function openIdb() {
+    if (idbHandle) return Promise.resolve(idbHandle);
+    if (idbFailed || typeof indexedDB === 'undefined') return Promise.reject(new Error('indexedDB unavailable'));
+    return new Promise((resolve, reject) => {
+      let req;
+      try { req = indexedDB.open(IDB_NAME, 1); } catch (e) { reject(e); return; }
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = () => { idbHandle = req.result; resolve(idbHandle); };
+      req.onerror = () => reject(req.error || new Error('indexedDB open failed'));
+    });
+  }
+
+  function idbPut(payload) {
+    return openIdb().then(db => new Promise((resolve, reject) => {
+      let tx;
+      try { tx = db.transaction(IDB_STORE, 'readwrite'); } catch (e) { reject(e); return; }
+      tx.objectStore(IDB_STORE).put(payload, 'session');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('indexedDB put failed'));
+    }));
+  }
+
+  function idbGet() {
+    return openIdb().then(db => new Promise((resolve, reject) => {
+      let tx;
+      try { tx = db.transaction(IDB_STORE, 'readonly'); } catch (e) { reject(e); return; }
+      const req = tx.objectStore(IDB_STORE).get('session');
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error || new Error('indexedDB get failed'));
+    }));
+  }
+
+  function fullBackupPayload() {
+    return {
       version: VERSION,
       session,
       lastUrl: location.href,
       savedAt: new Date().toISOString(),
       macroLog,
-      screenLog: screenLog.slice(-300),
-      networkLog: networkLog.slice(-500),
+      screenLog,
+      networkLog,
+      rawLog,
+      tasksLog,
+      currentTask,
       pageSeq,
       requestSeq
     };
-    if (backupMode === 'full') {
-      base.rawLog = rawLog.length > config.backupRawTail ? rawLog.slice(-config.backupRawTail) : rawLog;
-      base.rawTruncated = rawLog.length > config.backupRawTail;
-    }
-    return base;
+  }
+
+  // large text (CM6/textarea) обрезается только в компактной localStorage-версии —
+  // полное значение всё равно живёт в памяти и уходит в IndexedDB/экспорт без урезания
+  function macroLogForLocalStorage() {
+    return macroLog.map(a => {
+      if (a && a.action === 'fill' && a.isLargeText && typeof a.value === 'string' && a.value.length > 2000) {
+        return { ...a, value: trunc(a.value, 2000), valueTruncatedForLocalStorageBackup: true };
+      }
+      return a;
+    });
+  }
+
+  function compactBackupPayload() {
+    return {
+      version: VERSION,
+      session,
+      lastUrl: location.href,
+      savedAt: new Date().toISOString(),
+      macroLog: macroLogForLocalStorage(),
+      tasksLog,
+      currentTask,
+      pageSeq,
+      requestSeq
+    };
   }
 
   function writeBackup() {
     if (backupMode === 'off') return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(backupPayload()));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(compactBackupPayload()));
     } catch (e) {
-      if (backupMode === 'full') {
-        backupMode = 'macro-only';
-        native.consoleWarn.call(console, '[logger] квота localStorage исчерпана — в бэкап пишется только macroLog.');
-        writeBackup();
-        return;
-      }
       backupMode = 'off';
       try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
-      native.consoleWarn.call(console, '[logger] бэкап отключён (localStorage недоступен). Экспортируйте лог вручную.');
+      native.consoleWarn.call(console, '[logger] бэкап отключён — даже компактная версия не влезает в localStorage. Экспортируйте лог вручную.');
+      return;
     }
+    if (idbFailed || typeof indexedDB === 'undefined') return;
+    idbPut(fullBackupPayload()).catch(e => {
+      idbFailed = true;
+      native.consoleWarn.call(console, '[logger] IndexedDB бэкап недоступен — после перезагрузки восстановится только macroLog (без rawLog/screenLog/networkLog): ', e && e.message ? e.message : e);
+    });
   }
 
   function saveBackup(force = false) {
@@ -968,6 +1341,9 @@
     const effects = action.effects || {};
     if (effects.navigation && effects.navigation.toUrl) add('url', effects.navigation.toUrl, 'high');
     if (effects.popup) add('popup', effects.popup.url || effects.popup.pageId || 'popup opened', 'high');
+    if (effects.popup && effects.popup.attachable === false) {
+      add('manual_verification_required', { url: effects.popup.url, reason: 'target=_blank popup not instrumented by a one-shot page script' }, 'high');
+    }
     for (const d of effects.dialogs || []) add('dialog', { type: d.type, message: d.message, accepted: d.accepted }, 'high');
     for (const d of effects.downloads || []) add('download', { filename: d.filename || null, href: d.href || null }, 'medium');
     for (const u of (effects.ui || []).slice(0, 12)) {
@@ -978,6 +1354,10 @@
       for (const a of (action.diff.alerts && action.diff.alerts.added || []).slice(0, 8)) add('status_visible', a, 'high');
       for (const h of (action.diff.headings && action.diff.headings.added || []).slice(0, 6)) add('heading_visible', h, 'medium');
       if (action.diff.titleChanged) add('title', action.diff.titleChanged.to, 'medium');
+      for (const c of (action.diff.inputs && action.diff.inputs.changed || []).slice(0, 8)) add('input_value_changed', c, 'high');
+      for (const c of (action.diff.inputs && action.diff.inputs.added || []).slice(0, 6)) add('input_added', { name: c.name, text: c.text, locator: c.locator }, 'medium');
+      for (const c of (action.diff.inputs && action.diff.inputs.removed || []).slice(0, 6)) add('input_removed', { name: c.name, text: c.text, locator: c.locator }, 'medium');
+      if (action.diff.inputsOrderChanged) add('rows_reordered', true, 'medium');
     }
     for (const n of (effects.network || []).filter(x => x.phase === 'end' && x.status >= 400).slice(0, 5)) add('network_error_observed', { method: n.method, url: n.requestUrl, status: n.status }, 'high');
     const seen = new Set();
@@ -986,6 +1366,21 @@
       if (seen.has(k)) return false;
       seen.add(k); return true;
     });
+  }
+
+  // [v7.1][20] Probe API — предметное состояние приложения (активная вкладка, ключ
+  // документа, список строк Assets...), которое не выразить общими DOM-эвристиками.
+  // __logger.registerProbe(name, fn) вызывает fn('before'|'after') до/после каждого действия.
+  const probes = {};
+
+  function runProbes(phase) {
+    const out = {};
+    let any = false;
+    for (const [name, fn] of Object.entries(probes)) {
+      any = true;
+      try { out[name] = fn(phase); } catch (e) { out[name] = { __probeError: String(e && e.message || e) }; }
+    }
+    return any ? out : null;
   }
 
   function finalizeAction(action, reason = 'settled') {
@@ -999,6 +1394,8 @@
     action.rawSeqEnd = Math.max(action.rawSeqStart, rawSeq - 1);
     action.finalizedAt = new Date().toISOString();
     action.finalizeReason = reason;
+    action.probe = action.probe || {};
+    try { action.probe.after = runProbes('after'); } catch (_) {}
     action.inferredExpected = deriveExpected(action);
     if (after) recordScreen('after', action, ctx, after);
     delete action.__ctx;
@@ -1019,6 +1416,28 @@
   function ensureEffects(action) {
     if (!action.effects) action.effects = { network: [], ui: [], dialogs: [], downloads: [], errors: [], navigation: null, popup: null };
     return action.effects;
+  }
+
+  // [v7.2] тот же локатор + тот же тип действия повторно в пределах 15с, а предыдущий раз
+  // ничего видимо не изменил — почти всегда значит "не дождались", намёк на нужный wait
+  // в сгенерированном скрипте, а не два независимых шага.
+  const POSSIBLE_RETRY_WINDOW_MS = 15000;
+  function detectPossibleRetry(action) {
+    if (!action.locator || !action.locator.primary || !action.locator.primary.css) return null;
+    const css = action.locator.primary.css;
+    for (let i = macroLog.length - 1; i >= 0 && i >= macroLog.length - 20; i--) {
+      const prev = macroLog[i];
+      if (!prev || prev.action !== action.action) continue;
+      if (!prev.locator || !prev.locator.primary || prev.locator.primary.css !== css) continue;
+      const gap = (action.t || Date.now()) - prev.t;
+      if (gap > POSSIBLE_RETRY_WINDOW_MS) return null;
+      if (prev.finalizedAt && prev.diff && !prev.diff.fingerprintChanged &&
+          !(prev.diff.inputs && prev.diff.inputs.changed && prev.diff.inputs.changed.length)) {
+        return { previousActionId: prev.id, gapMs: gap };
+      }
+      return null;
+    }
+    return null;
   }
 
   function pushMacro(action) {
@@ -1048,11 +1467,17 @@
     action.rawSeqStart = Number.isInteger(action.rawSeqStart) ? action.rawSeqStart : Math.max(0, rawSeq - 1);
     action.sinceStartMs = Math.max(0, now - new Date(session.startedAt).getTime());
     action.locatorConfidence = locatorConfidence(action.locator);
+    action.taskId = currentTask ? currentTask.id : null;
+    action.possibleRetry = detectPossibleRetry(action);
     action.effects = action.effects || { network: [], ui: [], dialogs: [], downloads: [], errors: [], navigation: null, popup: null };
     const ctx = action.__ctx || ctxFor(action.__doc || document);
     const doc = action.__doc || document;
-    action.before = screenSnapshot(doc, ctx);
+    // [v7.1][16] dragTo подставляет свой pre-drag снапшот (нативный DOM к моменту pushMacro
+    // уже отражает НОВЫЙ порядок строк — снапшот "до" нужно взять до, а не в момент drop)
+    action.before = action.before || screenSnapshot(doc, ctx);
     if (action.before) recordScreen('before', action, ctx, action.before);
+    action.probe = { before: null, after: null };
+    try { action.probe.before = runProbes('before'); } catch (_) {}
     action.__ctx = ctx;
     action.__doc = doc;
 
@@ -1072,6 +1497,46 @@
     return last || null;
   }
 
+  // [v7.1][4] setFiles раньше писал только name/size/type — для миграции файл и есть
+  // результат (inline JS/CSS блок, выгруженный в отдельный ассет). Текстовые файлы читаем
+  // через File.text() и кладём в action.artifacts вместе с хэшем.
+  const TEXT_ARTIFACT_EXT = /\.(js|mjs|cjs|jsx|ts|tsx|css|scss|less|json|html|htm|svg|txt|md)$/i;
+  const TEXT_ARTIFACT_MIME = /^(text\/|application\/json|application\/javascript|application\/xml|image\/svg\+xml)/i;
+  const MAX_ARTIFACT_FILE_BYTES = 2 * 1024 * 1024;
+
+  function shouldCaptureFileContent(file) {
+    if (!file) return false;
+    if (file.size > MAX_ARTIFACT_FILE_BYTES) return false;
+    return TEXT_ARTIFACT_MIME.test(file.type || '') || TEXT_ARTIFACT_EXT.test(file.name || '');
+  }
+
+  async function captureFileArtifacts(fileList, action) {
+    if (!action) return;
+    const files = Array.from(fileList || []);
+    action.artifacts = action.artifacts || [];
+    for (const f of files) {
+      const meta = { name: f.name, size: f.size, type: f.type };
+      if (!shouldCaptureFileContent(f)) {
+        meta.contentCaptured = false;
+        action.artifacts.push(meta);
+        continue;
+      }
+      try {
+        const text = await f.text();
+        meta.contentCaptured = true;
+        meta.contentLength = text.length;
+        meta.contentHash = simpleHash(text);
+        meta.content = trunc(text, config.maxLargeText);
+        meta.truncated = text.length > config.maxLargeText;
+      } catch (e) {
+        meta.contentCaptured = false;
+        meta.captureError = String(e && e.message || e);
+      }
+      action.artifacts.push(meta);
+      saveBackup(false);
+    }
+  }
+
   // -------------------------------------------------------------- listeners
 
   const docContexts = new WeakMap();
@@ -1082,9 +1547,78 @@
   let effectObservers = [];
   let iframeObservers = [];
   let hoverCandidate = null;
+  let pointerDragCandidate = null; // [v7.1][16]
 
   function ctxFor(doc) {
     return docContexts.get(doc) || { label: 'top', frameChain: [], pageId: 'page-1' };
+  }
+
+  // [v7.1/v7.2][7] "к какой строке относится этот select/delete" — активная вкладка, заголовок
+  // раскрытой панели и URL из ближайшей строки. Без этого локатор вида nth-of-type ничего не
+  // говорит о том, какую именно строку затронуло действие.
+  function nearestRowUrl(el) {
+    try {
+      const row = el && el.closest ? el.closest('tr,[role="row"],[role="listitem"],.ant-list-item,.ant-table-row,li') : null;
+      if (!row) return null;
+      const urlInput = row.querySelector('input[type="text"],input[type="url"],input:not([type])');
+      if (urlInput && urlInput.value) return trunc(urlInput.value, 500);
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // [v7.2] Активная вкладка/заголовок панели почти никогда не являются ПРЕДКОМ элемента
+  // внутри их содержимого (это соседи по DOM: .ant-collapse-header — сосед .ant-collapse-content,
+  // а не его родитель) — el.closest() тут в принципе не может найти совпадение. Нужно сначала
+  // подняться до общего контейнера, а затем поискать заголовок/таб уже внутри него.
+  function nearestActiveTabLabel(el, maxLen) {
+    try {
+      const container = el.closest('.ant-tabs, [role="tablist"], [class*="tabs" i]');
+      if (!container) return null;
+      const activeTab = container.querySelector('.ant-tabs-tab-active .ant-tabs-tab-btn, .ant-tabs-tab-active, [role="tab"][aria-selected="true"]');
+      if (!activeTab) return null;
+      return collapse(activeTab.innerText || activeTab.textContent || '', maxLen || 160) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function nearestPanelHeaderLabel(el, maxLen) {
+    try {
+      const item = el.closest('.ant-collapse-item');
+      if (item) {
+        const header = item.querySelector('.ant-collapse-header');
+        if (header) return collapse(header.innerText || header.textContent || '', maxLen || 160) || null;
+      }
+      // generic ARIA: подняться по предкам и поискать элемент с id, на который где-то
+      // в документе ссылается aria-controls (стандартный паттерн disclosure/accordion)
+      let node = el, hops = 0;
+      while (node && node !== document.body && hops < 8) {
+        if (node.id) {
+          const trigger = document.querySelector(`[aria-controls="${quoteAttr(node.id)}"]`);
+          if (trigger) return collapse(trigger.innerText || trigger.textContent || '', maxLen || 160) || null;
+        }
+        node = node.parentElement;
+        hops++;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function buildContextChain(el) {
+    const chain = [];
+    try {
+      const tab = nearestActiveTabLabel(el, 160);
+      if (tab) chain.push({ kind: 'tab', label: tab });
+      const panel = nearestPanelHeaderLabel(el, 160);
+      if (panel) chain.push({ kind: 'panel', label: panel });
+      const rowUrl = nearestRowUrl(el);
+      if (rowUrl) chain.push({ kind: 'rowUrl', value: sanitizeUrl(rowUrl) || rowUrl });
+    } catch (_) {}
+    return chain;
   }
 
   function macroTarget(el, ctx) {
@@ -1099,6 +1633,7 @@
       },
       frameChain: ctx.frameChain || [],
       pageId: ctx.pageId || 'page-1',
+      contextChain: buildContextChain(el),
       __ctx: ctx,
       __doc: el.ownerDocument || document
     };
@@ -1113,9 +1648,54 @@
     return !['checkbox', 'radio', 'file', 'button', 'submit', 'reset', 'range', 'color', 'date', 'datetime-local', 'month', 'week', 'time'].includes(type);
   }
 
+  // [v7.1][1] CodeMirror 6 виртуализирует строки — innerText отдаёт только видимый кусок.
+  // node.cmView.view — внутренний, но стабильный способ достать полный EditorState.doc.
+  function isCodeMirrorContent(el) {
+    return safeMatches(el, '.cm-content');
+  }
+
+  function codeMirrorFullText(el) {
+    try {
+      const view = el && el.cmView && el.cmView.view;
+      if (view && view.state && view.state.doc && typeof view.state.doc.toString === 'function') {
+        return view.state.doc.toString();
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // Полное непорезанное значение поля (используется и для отображаемого value, и для
+  // hash/length/diff, которые обязаны отражать реальный контент, а не то, что влезло в лимит).
+  function rawEditableValue(el) {
+    if (isCodeMirrorContent(el)) {
+      const full = codeMirrorFullText(el);
+      if (full != null) return full;
+    }
+    if (el.isContentEditable) return el.innerText || el.textContent || '';
+    return 'value' in el ? el.value : '';
+  }
+
   function currentEditableValue(el) {
-    if (el.isContentEditable) return sanitizeValue(el, el.innerText || el.textContent || '');
-    return sanitizeValue(el, 'value' in el ? el.value : '');
+    return sanitizeValue(el, rawEditableValue(el));
+  }
+
+  // [v7.1] простой построчный diff (не LCS) — достаточно, чтобы увидеть, какие строки
+  // появились/исчезли между началом и концом серии debounce-вводов в одном поле.
+  function lineDiff(oldText, newText, limit = 40) {
+    const oldLines = String(oldText == null ? '' : oldText).split('\n');
+    const newLines = String(newText == null ? '' : newText).split('\n');
+    const oldSet = new Set(oldLines);
+    const newSet = new Set(newLines);
+    const addedLines = newLines.filter(l => !oldSet.has(l)).slice(0, limit).map(l => collapse(l, 300));
+    const removedLines = oldLines.filter(l => !newSet.has(l)).slice(0, limit).map(l => collapse(l, 300));
+    return {
+      addedLines,
+      removedLines,
+      addedCount: newLines.filter(l => !oldSet.has(l)).length,
+      removedCount: oldLines.filter(l => !newSet.has(l)).length,
+      oldLineCount: oldLines.length,
+      newLineCount: newLines.length
+    };
   }
 
   function flushInput(el, reason = 'debounce') {
@@ -1124,11 +1704,25 @@
     clearTimeout(pending.timer);
     pendingInputs.delete(el);
 
-    const value = currentEditableValue(el);
+    const sensitive = isSensitiveElement(el);
+    const raw = rawEditableValue(el);
+    const limit = fieldTextLimit(el);
+    const value = sensitive ? '[REDACTED]' : trunc(raw, limit);
+    const isLargeText = isCodeMirrorContent(el) || (isElement(el) && el.tagName === 'TEXTAREA') || !!(isElement(el) && el.isContentEditable);
+    const valueLength = sensitive ? null : raw.length;
+    const valueHash = sensitive ? null : simpleHash(raw);
+    const textDiff = (!sensitive && isLargeText && pending.initialValue != null && pending.initialValue !== raw)
+      ? lineDiff(pending.initialValue, raw)
+      : null;
+
     const prev = macroLog[macroLog.length - 1];
 
     if (prev && prev.action === 'fill' && sameLocator(prev.locator, pending.locator) && Date.now() - prev.t < 2500) {
       prev.value = value;
+      prev.valueLength = valueLength;
+      prev.valueHash = valueHash;
+      prev.isLargeText = isLargeText;
+      if (textDiff) prev.textDiff = textDiff;
       prev.reason = reason;
       prev.lastValueUpdateAt = new Date().toISOString();
       prev.inferredExpected = deriveExpected(prev);
@@ -1142,8 +1736,13 @@
       locator: pending.locator,
       target: pending.target,
       frameChain: pending.frameChain,
+      contextChain: pending.contextChain,
       value,
-      sensitive: isSensitiveElement(el),
+      valueLength,
+      valueHash,
+      isLargeText,
+      textDiff,
+      sensitive,
       reason,
       rawSeqStart: pending.rawSeqStart
     });
@@ -1154,7 +1753,13 @@
     if (old) clearTimeout(old.timer);
     const base = macroTarget(el, ctx);
     const timer = setTimeout(() => flushInput(el, 'debounce'), config.inputDebounceMs);
-    pendingInputs.set(el, { ...base, rawSeqStart: old && Number.isInteger(old.rawSeqStart) ? old.rawSeqStart : Math.max(0, rawSeq - 1), timer });
+    const initialValue = old && old.initialValue != null ? old.initialValue : rawEditableValue(el);
+    pendingInputs.set(el, {
+      ...base,
+      initialValue,
+      rawSeqStart: old && Number.isInteger(old.rawSeqStart) ? old.rawSeqStart : Math.max(0, rawSeq - 1),
+      timer
+    });
   }
 
   function flushAllInputs() {
@@ -1178,14 +1783,163 @@
 
     // v7: parent→submenu больше не отбрасывается. Hover сохраняем, если UI после dwell
     // изменился или клик произошёл внутри/рядом с раскрытым меню.
-    const after = screenSnapshot(el.ownerDocument || document, candidate.ctx);
+    // [v7.1][9] это только дешёвая light-проверка "стоит ли вообще записывать hover";
+    // если да — полноценные before/after строит обычный finalizeAction() у pushMacro.
+    const after = screenSnapshot(el.ownerDocument || document, candidate.ctx, { light: true });
     const diff = screenDiff(candidate.before, after);
     let related = false;
     try { related = !!(el.contains(clickEl) || clickEl.contains(el)); } catch (_) {}
     const changed = !!(diff && diff.fingerprintChanged);
     if (!changed && !related) return;
-    const a = pushMacro({ action: 'hover', ...macroTarget(el, candidate.ctx), inferred: true, hoverEvidence: { relatedToClick: related, uiChanged: changed, diff } });
-    if (a && after) { a.after = after; a.diff = diff; a.inferredExpected = deriveExpected(a); }
+    pushMacro({ action: 'hover', ...macroTarget(el, candidate.ctx), inferred: true, hoverEvidence: { relatedToClick: related, uiChanged: changed } });
+  }
+
+  // [v7.1][6] Ant Design не даёт native change/select-семантику: клик по опции в портале,
+  // Switch без checkbox, Collapse-заголовок и кнопки Popconfirm/Modal — всё это раньше писалось
+  // как безымянный "клик по div". Ищем ближайший известный паттерн AntD DOM и переобозначаем
+  // уже созданное действие вместо второго клика.
+  function findAntdSelectForDropdown(dropdownEl) {
+    try {
+      const listboxId = dropdownEl && dropdownEl.id;
+      if (!listboxId) return null;
+      const owner = document.querySelector(`[aria-owns="${listboxId}"],[aria-controls="${listboxId}"]`);
+      if (!owner) return null;
+      return owner.closest('.ant-select');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function annotateAntdInteractions(t, action) {
+    if (!isElement(t) || !action) return;
+    try {
+      const option = t.closest('.ant-select-item-option');
+      if (option) {
+        const dropdown = option.closest('.ant-select-dropdown');
+        const selectEl = dropdown ? findAntdSelectForDropdown(dropdown) : null;
+        const valueText = collapse(option.getAttribute('title') || option.textContent || '', 160);
+        const previousText = selectEl
+          ? collapse((selectEl.querySelector('.ant-select-selection-item') || {}).textContent || '', 160) || null
+          : null;
+        action.action = 'select';
+        action.value = valueText;
+        action.antd = { control: 'select', valueText, previousText };
+        if (selectEl) {
+          const loc = locatorInfo(selectEl);
+          if (loc) { action.locator = loc; action.locatorConfidence = locatorConfidence(loc); action.controlLocator = loc; }
+        }
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+
+      const sw = t.closest('.ant-switch');
+      if (sw) {
+        const checked = sw.getAttribute('aria-checked') === 'true';
+        action.action = 'toggle';
+        action.checked = checked;
+        action.antd = { control: 'switch', checked };
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+
+      const radio = t.closest('.ant-radio-wrapper,.ant-radio-button-wrapper');
+      if (radio) {
+        action.antd = { control: 'radio', label: collapse(radio.textContent || '', 160) };
+        return;
+      }
+
+      const collapseHeader = t.closest('.ant-collapse-header');
+      if (collapseHeader) {
+        const item = collapseHeader.closest('.ant-collapse-item');
+        const wasActive = item ? item.classList.contains('ant-collapse-item-active') : null;
+        action.action = 'expand';
+        action.antd = { control: 'collapse', panelTitle: collapse(collapseHeader.textContent || '', 160), wasActive };
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+
+      const popconfirmBtn = t.closest('.ant-popover-buttons button,.ant-popconfirm-buttons button');
+      if (popconfirmBtn) {
+        const isConfirm = popconfirmBtn.classList.contains('ant-btn-primary') || popconfirmBtn.classList.contains('ant-btn-dangerous');
+        action.antd = { control: 'popconfirm', choice: isConfirm ? 'confirm' : 'cancel', label: collapse(popconfirmBtn.textContent || '', 80) };
+        return;
+      }
+
+      const modalFooterBtn = t.closest('.ant-modal-footer button');
+      if (modalFooterBtn) {
+        const modal = modalFooterBtn.closest('.ant-modal');
+        const title = modal ? collapse((modal.querySelector('.ant-modal-title') || {}).textContent || '', 160) : null;
+        action.antd = { control: 'modal', label: collapse(modalFooterBtn.textContent || '', 80), modalTitle: title };
+        return;
+      }
+    } catch (_) {}
+  }
+
+  // [v7.2] generic-слой поверх WAI-ARIA — работает на ЛЮБОМ сайте (MUI, Radix, react-select,
+  // самописные компоненты), не только AntD. Запускается только если AntD-детектор выше не
+  // распознал паттерн (action.antd ещё не выставлен), чтобы не переобозначать дважды.
+  function annotateGenericAriaInteractions(t, action) {
+    if (!isElement(t) || !action || action.antd) return;
+    try {
+      const option = t.closest('[role="option"]');
+      if (option) {
+        const listbox = option.closest('[role="listbox"]');
+        const listboxId = listbox && listbox.id;
+        const owner = listboxId ? document.querySelector(`[aria-owns="${listboxId}"],[aria-controls="${listboxId}"],[aria-activedescendant]`) : null;
+        const valueText = collapse(option.textContent || '', 160);
+        action.action = 'select';
+        action.value = valueText;
+        action.aria = { control: 'listbox-option', valueText };
+        if (owner) {
+          const loc = locatorInfo(owner);
+          if (loc) { action.locator = loc; action.locatorConfidence = locatorConfidence(loc); action.controlLocator = loc; }
+        }
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+
+      const sw = t.closest('[role="switch"]');
+      if (sw) {
+        const checked = sw.getAttribute('aria-checked') === 'true';
+        action.action = 'toggle';
+        action.checked = checked;
+        action.aria = { control: 'switch', checked };
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+
+      const tab = t.closest('[role="tab"]');
+      if (tab) {
+        action.aria = { control: 'tab', label: collapse(tab.textContent || '', 160), selected: tab.getAttribute('aria-selected') === 'true' };
+        return;
+      }
+
+      // дисклоужер/аккордеон/дерево — любой триггер с aria-expanded, если это сам кликнутый
+      // элемент управления, а не случайный контейнер с этим атрибутом где-то выше по дереву
+      const disclosure = safeMatches(t, '[aria-expanded]') ? t : t.closest('button[aria-expanded],[role="button"][aria-expanded],summary[aria-expanded],[role="tab"][aria-expanded]');
+      if (disclosure) {
+        const wasExpanded = disclosure.getAttribute('aria-expanded') === 'true';
+        action.action = 'expand';
+        action.aria = { control: 'disclosure', label: collapse(disclosure.textContent || '', 160), wasExpanded };
+        action.inferredExpected = deriveExpected(action);
+        return;
+      }
+    } catch (_) {}
+  }
+
+  // [v7.2] эвристика "разрушительности": текст элемента/ближайшей кнопки-ссылки или её
+  // классы похожи на необратимое действие. Не завязано на конкретный сайт/дизайн-систему.
+  function computeDestructive(t, action) {
+    if (!isElement(t) || !action) return;
+    try {
+      const name = (action.locator && (action.locator.accessibleName || action.locator.text)) || (action.target && action.target.text) || '';
+      if (config.destructiveWordPattern.test(name)) { action.destructive = true; return; }
+      const control = t.closest('button,[role="button"],a,[role="menuitem"]') || t;
+      const cls = typeof control.className === 'string' ? control.className : '';
+      if (config.destructiveClassPattern.test(cls)) { action.destructive = true; return; }
+      const controlText = collapse(control.innerText || control.textContent || '', 160) || '';
+      if (config.destructiveWordPattern.test(controlText)) action.destructive = true;
+    } catch (_) {}
   }
 
   // [5] popup: клик, открывающий новую вкладку
@@ -1214,6 +1968,7 @@
           const ctx = { label: `popup:${pageId}`, frameChain: [], pageId };
           attachListeners(d, ctx);
           attachIframes(d, ctx);
+          patchNetwork(popupWindow);
         } catch (_) {}
       };
       setTimeout(tryAttach, 50);
@@ -1259,6 +2014,9 @@
         button: e.button
       });
       const action = pushMacro({ action: 'click', ...macroTarget(t, ctx), button: e.button });
+      annotateAntdInteractions(t, action);
+      annotateGenericAriaInteractions(t, action);
+      computeDestructive(t, action);
 
       try {
         const anchor = t.closest('a');
@@ -1278,8 +2036,12 @@
         if (anchor && anchor.target === '_blank' && action && !action.resultPopup) {
           const info = { url: sanitizeUrl(anchor.href), via: 'target_blank', pageId: `page-${++pageSeq}`, attachable: false };
           action.resultPopup = info;
+          // [v7.1][21] результат такого клика логгер проверить не может — явно помечаем,
+          // что нужна ручная верификация, вместо тихой потери факта проверки.
+          action.requiresManualVerification = true;
           ensureEffects(action).popup = info;
           action.inferredExpected = deriveExpected(action);
+          console.log('%c[logger] открылась вкладка (target=_blank) — результат не инструментируется. Проверьте вручную и вызовите __logger.expect({...}) или __logger.note("...").', 'color:orange');
         }
       } catch (_) {}
     });
@@ -1307,7 +2069,7 @@
       hoverTimer = setTimeout(() => {
         hoverTimer = null;
         if (isHoverSensitive(t) && t.isConnected) hoverCandidate = {
-          el: t, ctx, at: Date.now(), before: screenSnapshot(t.ownerDocument || doc, ctx)
+          el: t, ctx, at: Date.now(), before: screenSnapshot(t.ownerDocument || doc, ctx, { light: true })
         };
       }, config.hoverDwellMs);
     });
@@ -1362,7 +2124,8 @@
         });
       } else if (t.tagName === 'INPUT' && t.type === 'file') {
         raw.files = Array.from(t.files || []).map(f => ({ name: f.name, size: f.size, type: f.type }));
-        pushMacro({ action: 'setFiles', ...macroTarget(t, ctx), files: raw.files });
+        const fileAction = pushMacro({ action: 'setFiles', ...macroTarget(t, ctx), files: raw.files });
+        captureFileArtifacts(t.files, fileAction);
       } else if (t.type === 'checkbox' || t.type === 'radio') {
         raw.checked = !!t.checked;
         pushMacro({ action: t.checked ? 'check' : 'uncheck', ...macroTarget(t, ctx), checked: !!t.checked });
@@ -1518,6 +2281,55 @@
       dragSource = null;
     });
 
+    // [v7.1][16] реордер через pointer events (без нативного HTML5 DnD) — AntD/rc-компоненты
+    // часто двигают строки так, а не через dragstart/drop, и раньше это не писалось вообще.
+    const DRAG_HANDLE_SELECTOR = '[draggable="true"],tr,[role="row"],.ant-table-row,.ant-list-item,li,'
+      + '[class*="drag-handle" i],[class*="draghandle" i],[class*="sortable" i],[class*="dnd" i],[class*="drag" i]';
+    const DRAG_EXCLUDE_SELECTOR = 'input,textarea,select,[contenteditable="true"],.cm-editor,button,a,[role="button"]';
+
+    on(doc, 'pointerdown', e => {
+      if (!config.trackPointerDrag) return;
+      const t = actualTarget(e);
+      if (!t || isIgnoredEl(t)) return;
+      if (safeMatches(t, DRAG_EXCLUDE_SELECTOR) || (t.closest && t.closest(DRAG_EXCLUDE_SELECTOR))) return;
+      if (!safeMatches(t, DRAG_HANDLE_SELECTOR) && !(t.closest && t.closest(DRAG_HANDLE_SELECTOR))) return;
+      pointerDragCandidate = {
+        pointerId: e.pointerId, startEl: t, ctx, doc,
+        startX: e.clientX, startY: e.clientY, moved: false, before: null
+      };
+    });
+
+    on(doc, 'pointermove', e => {
+      const c = pointerDragCandidate;
+      if (!c || c.pointerId !== e.pointerId || c.moved) return;
+      const dx = e.clientX - c.startX, dy = e.clientY - c.startY;
+      if (Math.hypot(dx, dy) < config.pointerDragThresholdPx) return;
+      c.moved = true;
+      // полный (не light) снапшот — только он несёт inputs/rows, нужные для diff порядка;
+      // это разовая цена одного реального drag-жеста, не за каждый pointermove
+      try { c.before = screenSnapshot(c.doc, c.ctx); } catch (_) {}
+    });
+
+    const endPointerDrag = e => {
+      const c = pointerDragCandidate;
+      pointerDragCandidate = null;
+      if (!c || !c.moved || (e.pointerId != null && c.pointerId !== e.pointerId)) return;
+      const endT = actualTarget(e) || c.startEl;
+      pushMacro({
+        action: 'dragTo',
+        source: macroTarget(c.startEl, c.ctx),
+        destination: macroTarget(endT, c.ctx),
+        via: 'pointer',
+        before: c.before,
+        frameChain: c.ctx.frameChain || [],
+        pageId: c.ctx.pageId || 'page-1',
+        __ctx: c.ctx,
+        __doc: c.doc
+      });
+    };
+    on(doc, 'pointerup', endPointerDrag);
+    on(doc, 'pointercancel', endPointerDrag);
+
     setTimeout(() => attachIframes(doc, ctx), 0);
     watchIframes(doc, ctx);
     watchActionEffects(doc, ctx);
@@ -1537,6 +2349,7 @@
         };
         attachListeners(childDoc, childCtx);
         attachIframes(childDoc, childCtx);
+        try { patchNetwork(frame.contentWindow); } catch (_) {}
 
         // iframe может перезагрузиться и заменить document
         if (!frame.__alLoadHooked) {
@@ -1589,6 +2402,7 @@
       const effects = ensureEffects(action);
       for (const m of mutations) {
         if (effects.ui.length >= config.uiEffectsPerAction) break;
+        if (isElement(m.target) && isMutationExcluded(m.target)) continue;
         if (m.type === 'childList') {
           for (const n of m.addedNodes) {
             if (effects.ui.length >= config.uiEffectsPerAction) break;
@@ -1610,7 +2424,7 @@
           }
         } else if (m.type === 'characterData') {
           const target = isElement(m.target.parentElement) ? m.target.parentElement : null;
-          if (!target || isIgnoredEl(target)) continue;
+          if (!target || isIgnoredEl(target) || isMutationExcluded(target)) continue;
           if (safeMatches(target, '[role="alert"],[role="status"],[aria-live],h1,h2,h3,button')) {
             const node = compactElement(target);
             if (node) mergeUniqueEffects(effects.ui, { change: 'text', oldValue: trunc(m.oldValue, 200), newValue: collapse(m.target.textContent || '', 240), node, frame: ctx.label, at: new Date().toISOString() });
@@ -1659,7 +2473,7 @@
       for (const m of mutations) {
         if (changes.length >= MAX) break;
         const target = isElement(m.target) ? m.target : m.target.parentElement;
-        if (target && isIgnoredEl(target)) continue;
+        if (target && (isIgnoredEl(target) || isMutationExcluded(target))) continue;
 
         if (m.type === 'attributes') {
           if (isAnimatedNoise(target, m.attributeName)) continue;
@@ -1721,6 +2535,12 @@
     lastKnownUrl = newUrl;
     lastTitle = newTitle;
     saveBackup(true);
+    // [v7.2] первая SPA-навигация часто открывает совсем другой раздел приложения —
+    // стоит один раз пересканировать test-id атрибуты на свежем DOM
+    if (!idAttributeDiscoveryRanAfterNav) {
+      idAttributeDiscoveryRanAfterNav = true;
+      setTimeout(runIdAttributeDiscovery, 800);
+    }
   }
 
   history.pushState = function () {
@@ -1837,6 +2657,23 @@
     return native.consoleWarn.apply(console, args);
   };
 
+  // [v7.1][17] console.log/info раньше не писались вообще. Сообщения самого логгера
+  // ("[logger] ...") отфильтровываются, чтобы не засорять raw log собственной болтовнёй.
+  function isLoggerOwnMessage(args) {
+    const first = args && args[0];
+    return typeof first === 'string' && first.indexOf('[logger') !== -1;
+  }
+
+  console.log = function (...args) {
+    if (!isLoggerOwnMessage(args)) pushRaw({ kind: 'console', type: 'log', args: args.map(a => trunc(String(a), 300)) });
+    return native.consoleLog.apply(console, args);
+  };
+
+  console.info = function (...args) {
+    if (!isLoggerOwnMessage(args)) pushRaw({ kind: 'console', type: 'info', args: args.map(a => trunc(String(a), 300)) });
+    return native.consoleInfo.apply(console, args);
+  };
+
   // --------------------------------------------------------------- network
 
   // [2] input может быть string | URL | Request
@@ -1849,9 +2686,10 @@
     try { return String(input); } catch (_) { return null; }
   }
 
-  function requestBodyOf(input, init) {
-    if (init && init.body != null) return sanitizeBody(init.body);
-    if (!config.captureNetworkBodies) return input && typeof input.clone === 'function' ? '[BODY_NOT_CAPTURED]' : null;
+  function requestBodyOf(input, init, url, actionId) {
+    const force = shouldCaptureBody(url, { actionId });
+    if (init && init.body != null) return sanitizeBody(init.body, force);
+    if (!config.captureNetworkBodies && !force) return input && typeof input.clone === 'function' ? '[BODY_NOT_CAPTURED]' : null;
     if (input && typeof input.clone === 'function' && input.method && input.method !== 'GET') {
       return '[REQUEST_BODY_ASYNC]'; // тело Request читается только асинхронно, не блокируем запрос
     }
@@ -1878,89 +2716,119 @@
     return item;
   }
 
-  if (typeof native.fetch === 'function') {
-    window.fetch = function (input, init) {
-      const rawUrl = requestUrlOf(input);
-      if (!config.trackNetwork || isIgnoredUrl(rawUrl)) return native.fetch.apply(this, arguments);
+  // [v7.1][13] fetch/XHR патчились только в top-window: у same-origin iframe свои
+  // прототипы/globalThis, поэтому запросы из worker-iframe раньше не попадали в лог вообще.
+  // patchNetwork(win) — переиспользуемая фабрика, вызывается и для window, и для каждого
+  // same-origin iframe.contentWindow из attachIframes().
+  const patchedWindows = new WeakSet();
+  const patchedWindowsList = [];
+  const nativeByWindow = new WeakMap();
 
-      const url = sanitizeUrl(rawUrl);
-      const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
-      const start = Date.now();
-      const requestId = `r-${++requestSeq}`;
-      const correlated = currentActionForCorrelation(config.networkCorrelationMs);
-      const actionId = correlated ? correlated.id : null;
-      const body = requestBodyOf(input, init);
+  function patchNetwork(win) {
+    if (!win || patchedWindows.has(win)) return;
+    let nativeFetch, nativeXhrOpen, nativeXhrSend;
+    try { nativeFetch = win.fetch; } catch (_) {}
+    try { nativeXhrOpen = win.XMLHttpRequest && win.XMLHttpRequest.prototype.open; } catch (_) {}
+    try { nativeXhrSend = win.XMLHttpRequest && win.XMLHttpRequest.prototype.send; } catch (_) {}
+    if (typeof nativeFetch !== 'function' && !(nativeXhrOpen && nativeXhrSend)) return;
 
-      pushRaw({ kind: 'network', type: 'fetch_start', requestId, actionId, requestUrl: url, method, body });
-      pushNetwork({ phase: 'start', transport: 'fetch', requestId, requestUrl: url, method, body }, actionId);
+    patchedWindows.add(win);
+    patchedWindowsList.push(win);
+    nativeByWindow.set(win, { fetch: nativeFetch, xhrOpen: nativeXhrOpen, xhrSend: nativeXhrSend });
 
-      return native.fetch.apply(this, arguments).then(res => {
-        const base = {
-          phase: 'end', transport: 'fetch', requestId,
-          requestUrl: url, finalUrl: sanitizeUrl(res.url), method,
-          status: res.status, ok: res.ok, durationMs: Date.now() - start
-        };
+    if (typeof nativeFetch === 'function') {
+      win.fetch = function (input, init) {
+        const rawUrl = requestUrlOf(input);
+        if (!config.trackNetwork || isIgnoredUrl(rawUrl)) return nativeFetch.apply(this, arguments);
 
-        if (!config.captureResponseBodies) {
-          pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...base });
-          pushNetwork(base, actionId);
+        const url = sanitizeUrl(rawUrl);
+        const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        const start = Date.now();
+        const requestId = `r-${++requestSeq}`;
+        const correlated = currentActionForCorrelation(config.networkCorrelationMs);
+        const actionId = correlated ? correlated.id : null;
+        const body = requestBodyOf(input, init, url, actionId);
+
+        pushRaw({ kind: 'network', type: 'fetch_start', requestId, actionId, requestUrl: url, method, body });
+        pushNetwork({ phase: 'start', transport: 'fetch', requestId, requestUrl: url, method, body }, actionId);
+
+        return nativeFetch.apply(this, arguments).then(res => {
+          const base = {
+            phase: 'end', transport: 'fetch', requestId,
+            requestUrl: url, finalUrl: sanitizeUrl(res.url), method,
+            status: res.status, ok: res.ok, durationMs: Date.now() - start
+          };
+          const allow = shouldCaptureBody(url, { actionId, status: res.status, ok: res.ok })
+            || shouldCaptureBody(res.url, { actionId, status: res.status, ok: res.ok });
+
+          if (!config.captureResponseBodies && !allow) {
+            pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...base });
+            pushNetwork(base, actionId);
+            return res;
+          }
+
+          try {
+            res.clone().text()
+              .then(text => {
+                const withBody = { ...base, responsePreview: truncBytes(text, allow ? config.bodyCaptureAllowlistMaxBytes : config.maxText) };
+                pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...withBody });
+                pushNetwork(withBody, actionId);
+              })
+              .catch(() => { pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...base }); pushNetwork(base, actionId); });
+          } catch (_) {
+            pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...base });
+            pushNetwork(base, actionId);
+          }
           return res;
-        }
-
-        try {
-          res.clone().text()
-            .then(text => {
-              const withBody = { ...base, responsePreview: trunc(text) };
-              pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...withBody });
-              pushNetwork(withBody, actionId);
-            })
-            .catch(() => { pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...base }); pushNetwork(base, actionId); });
-        } catch (_) {
-          pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...base });
+        }).catch(err => {
+          const base = { phase: 'error', transport: 'fetch', requestId, requestUrl: url, method, error: trunc(String(err), 300), durationMs: Date.now() - start };
+          pushRaw({ kind: 'network', type: 'fetch_error', actionId, ...base });
           pushNetwork(base, actionId);
-        }
-        return res;
-      }).catch(err => {
-        const base = { phase: 'error', transport: 'fetch', requestId, requestUrl: url, method, error: trunc(String(err), 300), durationMs: Date.now() - start };
-        pushRaw({ kind: 'network', type: 'fetch_error', actionId, ...base });
-        pushNetwork(base, actionId);
-        throw err;
-      });
-    };
+          throw err;
+        });
+      };
+    }
+
+    if (nativeXhrOpen && nativeXhrSend && win.XMLHttpRequest) {
+      win.XMLHttpRequest.prototype.open = function (method, url) {
+        this.__alMeta = { method: String(method || 'GET').toUpperCase(), rawUrl: url, url: sanitizeUrl(url) };
+        return nativeXhrOpen.apply(this, arguments);
+      };
+
+      win.XMLHttpRequest.prototype.send = function (body) {
+        const meta = this.__alMeta;
+        if (!meta || !config.trackNetwork || isIgnoredUrl(meta.rawUrl)) return nativeXhrSend.apply(this, arguments);
+
+        meta.start = Date.now();
+        meta.requestId = `r-${++requestSeq}`;
+        const correlated = currentActionForCorrelation(config.networkCorrelationMs);
+        meta.actionId = correlated ? correlated.id : null;
+        const allowRequest = shouldCaptureBody(meta.url, { actionId: meta.actionId });
+        const requestBody = sanitizeBody(body, allowRequest);
+        pushRaw({ kind: 'network', type: 'xhr_start', requestId: meta.requestId, actionId: meta.actionId, requestUrl: meta.url, method: meta.method, body: requestBody });
+        pushNetwork({ phase: 'start', transport: 'xhr', requestId: meta.requestId, requestUrl: meta.url, method: meta.method, body: requestBody }, meta.actionId);
+
+        this.addEventListener('loadend', () => {
+          const ok = this.status >= 200 && this.status < 400;
+          const allow = allowRequest || shouldCaptureBody(meta.url, { actionId: meta.actionId, status: this.status, ok });
+          const base = {
+            phase: 'end', transport: 'xhr', requestId: meta.requestId,
+            requestUrl: meta.url, finalUrl: sanitizeUrl(this.responseURL), method: meta.method,
+            status: this.status, ok, durationMs: Date.now() - meta.start
+          };
+          if (config.captureResponseBodies || allow) {
+            try { if (!this.responseType || this.responseType === 'text') base.responsePreview = truncBytes(this.responseText, allow ? config.bodyCaptureAllowlistMaxBytes : config.maxText); } catch (_) {}
+          }
+          pushRaw({ kind: 'network', type: 'xhr_end', actionId: meta.actionId, ...base });
+          pushNetwork(base, meta.actionId);
+        }, { once: true });
+
+        return nativeXhrSend.apply(this, arguments);
+      };
+    }
   }
 
-  XMLHttpRequest.prototype.open = function (method, url) {
-    this.__alMeta = { method: String(method || 'GET').toUpperCase(), rawUrl: url, url: sanitizeUrl(url) };
-    return native.xhrOpen.apply(this, arguments);
-  };
-
-  XMLHttpRequest.prototype.send = function (body) {
-    const meta = this.__alMeta;
-    if (!meta || !config.trackNetwork || isIgnoredUrl(meta.rawUrl)) return native.xhrSend.apply(this, arguments);
-
-    meta.start = Date.now();
-    meta.requestId = `r-${++requestSeq}`;
-    const correlated = currentActionForCorrelation(config.networkCorrelationMs);
-    meta.actionId = correlated ? correlated.id : null;
-    const requestBody = sanitizeBody(body);
-    pushRaw({ kind: 'network', type: 'xhr_start', requestId: meta.requestId, actionId: meta.actionId, requestUrl: meta.url, method: meta.method, body: requestBody });
-    pushNetwork({ phase: 'start', transport: 'xhr', requestId: meta.requestId, requestUrl: meta.url, method: meta.method, body: requestBody }, meta.actionId);
-
-    this.addEventListener('loadend', () => {
-      const base = {
-        phase: 'end', transport: 'xhr', requestId: meta.requestId,
-        requestUrl: meta.url, finalUrl: sanitizeUrl(this.responseURL), method: meta.method,
-        status: this.status, ok: this.status >= 200 && this.status < 400, durationMs: Date.now() - meta.start
-      };
-      if (config.captureResponseBodies) {
-        try { if (!this.responseType || this.responseType === 'text') base.responsePreview = trunc(this.responseText); } catch (_) {}
-      }
-      pushRaw({ kind: 'network', type: 'xhr_end', actionId: meta.actionId, ...base });
-      pushNetwork(base, meta.actionId);
-    }, { once: true });
-
-    return native.xhrSend.apply(this, arguments);
-  };
+  patchNetwork(window);
 
   // v7 download detection for programmatic Blob/ObjectURL + anchor.click().
   const blobUrls = new Map();
@@ -2060,6 +2928,38 @@
     };
   }
 
+  // [v7.1][11] один и тот же снапшот раньше попадал в экспорт дважды: целиком внутри
+  // action.before/after И отдельной записью в screenLog. Дедуп только на экспорте (по
+  // fingerprint) — runtime screenDiff/deriveExpected продолжают работать с живыми
+  // объектами как раньше, это чисто изменение формы итогового JSON.
+  function dedupScreens(actions) {
+    const byFingerprint = new Map();
+    const screens = [];
+    function addSnapshot(snapshot) {
+      if (!snapshot) return null;
+      const fp = snapshot.fingerprint || null;
+      if (fp && byFingerprint.has(fp)) return byFingerprint.get(fp);
+      const id = `scr-${screens.length}`;
+      screens.push({ id, ...snapshot });
+      if (fp) byFingerprint.set(fp, id);
+      return id;
+    }
+    function refFor(snapshot) {
+      if (!snapshot) return null;
+      const id = addSnapshot(snapshot);
+      return { ref: id, fingerprint: snapshot.fingerprint || null, url: snapshot.url || null, title: snapshot.title || null };
+    }
+    for (const a of actions) {
+      if (a.before) a.before = refFor(a.before);
+      if (a.after) a.after = refFor(a.after);
+    }
+    // прочие записи screenLog (session_start и т.п.), не покрытые before/after ни одного действия
+    for (const entry of screenLog) {
+      if (entry && entry.snapshot) addSnapshot(entry.snapshot);
+    }
+    return screens;
+  }
+
   function cleanActionForExport(action) {
     const out = {};
     for (const [k, v] of Object.entries(action || {})) {
@@ -2080,9 +2980,10 @@
       return x || fallback || 'VALUE';
     };
     for (const a of actions) {
-      if (!['fill','select','check','uncheck','setFiles'].includes(a.action)) continue;
+      if (!['fill','select','check','uncheck','setFiles','toggle'].includes(a.action)) continue;
       let value = a.value;
       if (a.action === 'check' || a.action === 'uncheck') value = !!a.checked;
+      if (a.action === 'toggle') value = !!a.checked;
       if (a.action === 'setFiles') value = (a.files || []).map(f => f.name);
       const rawName = a.locator && (a.locator.accessibleName || a.locator.ariaLabel || (a.locator.primary && a.locator.primary.value)) || a.target && a.target.text || a.action;
       const base = slug(rawName, a.action.toUpperCase());
@@ -2116,9 +3017,55 @@
       }
       if (a.effects && a.effects.errors && a.effects.errors.length) warnings.push({ type: 'runtime_error', actionId: a.id, errors: a.effects.errors });
       if (a.action === 'setFiles') warnings.push({ type: 'file_paths_not_recorded', actionId: a.id, files: a.files });
-      if (a.resultPopup && a.resultPopup.attachable === false) warnings.push({ type: 'popup_not_instrumented', actionId: a.id, popup: a.resultPopup, note: 'target=_blank popup cannot be automatically instrumented from a one-shot DevTools page script' });
+      if (a.resultPopup && a.resultPopup.attachable === false) warnings.push({ type: 'popup_not_instrumented', actionId: a.id, popup: a.resultPopup, note: 'target=_blank popup cannot be automatically instrumented from a one-shot DevTools page script — requires __logger.expect()/note() during the manual run' });
     }
     return warnings;
+  }
+
+  // [v7.2] Собирает "что нужно уточнить у оператора" автоматически, по фактам записи —
+  // цель в том, чтобы получателю (ассистенту, пишущему скрипт автоматизации) не пришлось
+  // руками искать слабые места по всему таймлайну на каждую присланную запись.
+  function buildOpenQuestions(actions) {
+    const out = [];
+    for (const a of actions) {
+      const hasHuman = !!((a.humanExpected && a.humanExpected.length) || (a.humanNotes && a.humanNotes.length));
+
+      if (a.locatorConfidence && a.locatorConfidence.level === 'low' && !hasHuman) {
+        out.push({
+          type: 'weak_locator_unconfirmed', actionId: a.id, order: a.order,
+          question: `Шаг ${a.order} (${a.action}): локатор не подтверждён уникальным (${a.locator && a.locator.primary && a.locator.primary.css}). Это точно тот элемент?`
+        });
+      }
+      if (a.requiresManualVerification && !hasHuman) {
+        out.push({
+          type: 'manual_verification_missing', actionId: a.id, order: a.order,
+          question: `Шаг ${a.order} открыл вкладку/попап, результат не проверен автоматически — что там должно было появиться?`
+        });
+      }
+      if (a.possibleRetry) {
+        out.push({
+          type: 'possible_retry', actionId: a.id, order: a.order,
+          question: `Шаг ${a.order} повторяет клик по тому же элементу, что и шаг #${a.possibleRetry.previousActionId} без видимого эффекта между ними — нужен явный wait перед этим шагом?`
+        });
+      }
+      if (a.destructive && a.diff && !a.diff.fingerprintChanged && !(a.diff.inputs && a.diff.inputs.changed && a.diff.inputs.changed.length)) {
+        out.push({
+          type: 'destructive_no_visible_effect', actionId: a.id, order: a.order,
+          question: `Шаг ${a.order} похож на разрушительное действие, но видимых изменений на экране не зафиксировано — он реально сработал (может, было доп. подтверждение вне записи)?`
+        });
+      }
+      if (a.effects && a.effects.network) {
+        for (const n of a.effects.network) {
+          if (n.phase === 'end' && n.status >= 400 && !hasHuman) {
+            out.push({
+              type: 'network_error_unconfirmed', actionId: a.id, order: a.order,
+              question: `Шаг ${a.order} вызвал ${n.method} ${n.requestUrl} -> ${n.status}. Это ожидаемая ошибка сценария или сбой?`
+            });
+          }
+        }
+      }
+    }
+    return out;
   }
 
   function actionHuman(a) {
@@ -2130,6 +3077,8 @@
       case 'hover': return `Hover ${JSON.stringify(name || 'element')}`;
       case 'fill': return `Fill ${JSON.stringify(name || 'field')} with ${a.sensitive ? '<SECRET>' : JSON.stringify(a.value)}`;
       case 'select': return `Select ${JSON.stringify(a.value)} in ${JSON.stringify(name || 'select')}`;
+      case 'toggle': return `Toggle ${JSON.stringify(name || 'switch')} to ${a.checked ? 'ON' : 'OFF'}`;
+      case 'expand': return `Expand/collapse panel ${JSON.stringify(a.antd && a.antd.panelTitle || name || 'section')}`;
       case 'check': return `Check ${JSON.stringify(name || 'checkbox')}`;
       case 'uncheck': return `Uncheck ${JSON.stringify(name || 'checkbox')}`;
       case 'press': return `Press ${pressKey(a)} on ${JSON.stringify(name || 'active element')}`;
@@ -2151,8 +3100,19 @@
     lines.push('');
     lines.push('## Ordered steps');
     lines.push('');
+    const taskById = new Map((tasksLog || []).map(t => [t.id, t]));
+    let openTaskId = undefined;
     for (const a of actions) {
       if (a.action === 'mark') continue;
+      if (a.taskId !== openTaskId) {
+        openTaskId = a.taskId;
+        if (openTaskId) {
+          const task = taskById.get(openTaskId);
+          const label = task && task.meta ? JSON.stringify(task.meta) : openTaskId;
+          lines.push(`## Task: ${label}`);
+          lines.push('');
+        }
+      }
       lines.push(`### ${a.order}. ${actionHuman(a)}`);
       lines.push(`- actionId: ${a.id}`);
       lines.push(`- page/frame: ${a.pageId || 'page-1'} / ${(a.frameChain || []).join(' -> ') || 'top'}`);
@@ -2178,12 +3138,14 @@
     for (const a of macroLog) if (a) a.inferredExpected = deriveExpected(a);
   }
 
-  function exportBundle(filename = `action-log-v7-${Date.now()}.json`) {
+  function exportBundle(filename = `action-log-v7-${resolvedMacroName()}-${Date.now()}.json`) {
     finalizeAllActions();
     saveBackup(true);
     const actions = macroLog.map(cleanActionForExport);
     const variables = buildVariables(actions);
     const warnings = buildWarnings(actions);
+    const openQuestions = buildOpenQuestions(actions);
+    const screens = dedupScreens(actions);
     const payload = {
       schema: 'action-logger-ai-v7',
       schemaPurpose: 'AI-first deterministic browser trace for reconstructing user steps, drafting requirements, and generating macros/tests',
@@ -2195,9 +3157,11 @@
       stats: {
         rawEvents: rawLog.length,
         macroActions: actions.length,
-        screenSnapshots: screenLog.length,
+        screenSnapshotsCaptured: screenLog.length,
+        screenSnapshotsDeduped: screens.length,
         networkEntries: networkLog.length,
         weakLocators: actions.filter(a => a.locatorConfidence && a.locatorConfidence.level === 'low').length,
+        openQuestions: openQuestions.length,
         backupMode
       },
       aiInstructions: {
@@ -2207,12 +3171,15 @@
         useBeforeAfterAndEffectsToInferWaitsAndAssertions: true,
         secrets: 'Values marked REDACTED must be parameterized, never guessed',
         locatorRule: 'Prefer high-confidence semantic/test-id locators; low-confidence locators require repair instead of blindly using .first()',
-        popupRule: 'pageId separates browser pages when observable; target=_blank may be recorded but not instrumented by a one-shot page script'
+        popupRule: 'pageId separates browser pages when observable; target=_blank may be recorded but not instrumented by a one-shot page script',
+        openQuestionsRule: 'Resolve openQuestions[] with the user in one batch before writing automation for the affected steps — do not guess destructive/ambiguous steps silently'
       },
       timeline: actions,
+      tasks: tasksLog,
       variables,
       warnings,
-      screens: screenLog,
+      openQuestions,
+      screens,
       network: networkLog,
       rawLog,
       generated: {
@@ -2222,10 +3189,13 @@
     };
     deliver(filename, JSON.stringify(payload, null, 2));
     console.log(`[logger] AI bundle: ${rawLog.length} raw / ${actions.length} actions / ${networkLog.length} network / ${screenLog.length} screens`);
+    if (openQuestions.length) {
+      console.log(`%c[logger] ${openQuestions.length} открытых вопросов — см. payload.openQuestions`, 'color:orange');
+    }
     return payload;
   }
 
-  function exportMacro(filename = `macro-log-v7-${Date.now()}.json`) {
+  function exportMacro(filename = `macro-log-v7-${resolvedMacroName()}-${Date.now()}.json`) {
     flushAllInputs();
     saveBackup(true);
     const payload = {
@@ -2238,6 +3208,64 @@
     };
     deliver(filename, JSON.stringify(payload, null, 2));
     console.log(`[logger] macro: ${macroLog.length} actions`);
+  }
+
+  // [v7.1][11] компактный "рецепт" для ассистента — без полных снапшотов/тел сети/rawLog,
+  // только то, из чего пишется код: локатор, значение(+hash), contextChain, diff-сводка.
+  function buildPlan(actions) {
+    return actions.map(a => ({
+      order: a.order,
+      id: a.id,
+      taskId: a.taskId || null,
+      t: a.iso,
+      action: a.action,
+      human: actionHuman(a),
+      locator: a.locator ? { primary: a.locator.primary, pw: a.locator.pw, confidence: a.locatorConfidence } : null,
+      contextChain: a.contextChain || [],
+      // большой CM6/textarea-текст сюда не тащим целиком (это отдельно есть в AI JSON) —
+      // только превью + hash/length + line-diff, этого достаточно, чтобы понять что менялось
+      value: a.isLargeText && typeof a.value === 'string' ? trunc(a.value, 500) : a.value,
+      valueLength: a.valueLength || null,
+      valueHash: a.valueHash || null,
+      isLargeText: !!a.isLargeText,
+      textDiff: a.textDiff || null,
+      checked: a.checked,
+      antd: a.antd || null,
+      aria: a.aria || null,
+      destructive: !!a.destructive,
+      possibleRetry: a.possibleRetry || null,
+      requiresManualVerification: a.requiresManualVerification || false,
+      artifacts: (a.artifacts || []).map(x => ({ name: x.name, size: x.size, contentHash: x.contentHash || null, contentCaptured: !!x.contentCaptured })),
+      network: (a.effects && a.effects.network || []).filter(n => n.phase !== 'start').map(n => ({ method: n.method, url: n.requestUrl, status: n.status, hasBody: n.responsePreview != null })),
+      inferredExpected: a.inferredExpected || [],
+      humanExpected: a.humanExpected || [],
+      humanNotes: a.humanNotes || [],
+      diffSummary: a.diff ? {
+        urlChanged: a.diff.urlChanged || null,
+        titleChanged: a.diff.titleChanged || null,
+        inputsChanged: (a.diff.inputs && a.diff.inputs.changed || []).length,
+        inputsOrderChanged: !!a.diff.inputsOrderChanged,
+        dialogsAdded: (a.diff.dialogs && a.diff.dialogs.added || []).length,
+        alertsAdded: (a.diff.alerts && a.diff.alerts.added || []).length
+      } : null
+    }));
+  }
+
+  function exportPlan(filename = `action-plan-v7-${resolvedMacroName()}-${Date.now()}.json`) {
+    finalizeAllActions();
+    const actions = macroLog.map(cleanActionForExport);
+    const payload = {
+      schema: 'action-logger-plan-v7',
+      version: VERSION,
+      exportedAt: new Date().toISOString(),
+      session: { id: session.id, macroName: resolvedMacroName(), startUrl: session.startUrl, startedAt: session.startedAt },
+      tasks: tasksLog,
+      openQuestions: buildOpenQuestions(actions),
+      steps: buildPlan(actions)
+    };
+    deliver(filename, JSON.stringify(payload, null, 2));
+    console.log(`[logger] plan: ${payload.steps.length} шагов, ${payload.openQuestions.length} открытых вопросов`);
+    return payload;
   }
 
   // ------------------------------------------------- [9][10][15] Playwright
@@ -2354,7 +3382,22 @@
         }
         break;
       case 'select':
-        if (sel) actionExpr = `${sel}.selectOption(${Array.isArray(a.value) ? jsValue(a.value) : jsString(a.value)})`;
+        if ((a.antd && a.antd.control === 'select') || (a.aria && a.aria.control === 'listbox-option')) {
+          // [v7.1/v7.2] кастомный select (AntD или generic ARIA listbox) — не нативный
+          // <select>, .selectOption() тут не работает: открываем дропдаун кликом по
+          // контролу и кликаем нужную опцию по тексту.
+          if (sel) push(`await ${sel}.click();`);
+          push(`await page.getByRole('option', ${jsOptions({ name: a.value, exact: true })}).click();`);
+        } else if (sel) {
+          actionExpr = `${sel}.selectOption(${Array.isArray(a.value) ? jsValue(a.value) : jsString(a.value)})`;
+        }
+        break;
+      case 'toggle':
+        actionExpr = sel ? `${sel}.click()` : null;
+        if (actionExpr) push(`// AntD Switch -> ${a.checked ? 'checked' : 'unchecked'}`);
+        break;
+      case 'expand':
+        actionExpr = sel ? `${sel}.click()` : null;
         break;
       case 'setFiles':
         if (sel) {
@@ -2438,6 +3481,7 @@
     lines.push(`  deviceScaleFactor: ${env.deviceScaleFactor},`);
     lines.push(`  locale: ${jsString(env.locale)},`);
     lines.push(`  timezoneId: ${jsString(env.timezone || 'UTC')},`);
+    lines.push(`  testIdAttribute: ${jsString(config.testIdAttribute)},`);
     lines.push(`});`);
     lines.push('');
     lines.push(`test('recorded scenario', async ({ page }) => {`);
@@ -2472,7 +3516,7 @@
     return lines.join('\n');
   }
 
-  function exportPlaywright(filename = `macro-playwright-v7-${Date.now()}.spec.js`) {
+  function exportPlaywright(filename = `macro-playwright-v7-${resolvedMacroName()}-${Date.now()}.spec.js`) {
     deliver(filename, generatePlaywright(), 'text/javascript');
     console.log(`[logger] Playwright: ${macroLog.length} действий`);
   }
@@ -2558,6 +3602,7 @@
           ${button('🏷 Метка', '__al-mark')}
           ${button('📊 Статы', '__al-stats')}
           ${button('💾 AI JSON', '__al-export')}
+          ${button('📝 Plan', '__al-export-plan')}
           ${button('▶ PW отдельно', '__al-export-pw')}
           ${button('■ Стоп + экспорт', '__al-stop')}
           ${button('📋 Копия', '__al-copy')}
@@ -2587,6 +3632,7 @@
     });
     panel.querySelector('#__al-stats').addEventListener('click', stats);
     panel.querySelector('#__al-export').addEventListener('click', () => exportBundle());
+    panel.querySelector('#__al-export-plan').addEventListener('click', () => exportPlan());
     panel.querySelector('#__al-export-pw').addEventListener('click', () => exportPlaywright());
     panel.querySelector('#__al-copy').addEventListener('click', copyLast);
     panel.querySelector('#__al-stop').addEventListener('click', stop);
@@ -2668,8 +3714,10 @@
     macroLog.length = 0;
     screenLog.length = 0;
     networkLog.length = 0;
+    tasksLog.length = 0;
     actionsById.clear();
     currentAction = null;
+    currentTask = null;
     rawSeq = 0;
     macroSeq = 0;
     requestSeq = 0;
@@ -2677,8 +3725,39 @@
     hoverCandidate = null;
     backupMode = 'full';
     try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
+    if (typeof indexedDB !== 'undefined' && !idbFailed) {
+      openIdb().then(db => {
+        try {
+          const tx = db.transaction(IDB_STORE, 'readwrite');
+          tx.objectStore(IDB_STORE).delete('session');
+        } catch (_) {}
+      }).catch(() => {});
+    }
     updatePanel();
     console.log('[logger] очищено');
+  }
+
+  // [v7.2] Раз одна и та же утилита пишет макросы для разных задач/сайтов, файлы нужно
+  // различать без открытия каждого — по умолчанию имя берётся из пути страницы, но лучше
+  // явно задать __logger.setMacroName('add-js-asset') в начале записи.
+  function slugify(s, fallback) {
+    const x = String(s || '').toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+    return x || fallback || 'session';
+  }
+
+  function defaultMacroName() {
+    try { return slugify(new URL(session.startUrl).pathname, 'session'); }
+    catch (_) { return 'session'; }
+  }
+
+  function resolvedMacroName() {
+    return slugify(session.macroName || defaultMacroName(), 'session');
+  }
+
+  function setMacroName(name) {
+    session.macroName = name ? String(name).trim() : null;
+    saveBackup(true);
+    console.log(`%c[logger] имя макроса: ${resolvedMacroName()}`, 'color:cyan');
   }
 
   function mark(label) {
@@ -2686,6 +3765,68 @@
     pushRaw({ kind: 'mark', type: 'mark', label: text });
     pushMacro({ action: 'mark', label: text, frameChain: [] });
     console.log(`%c[logger] метка: ${text}`, 'color:magenta');
+  }
+
+  // [v7.1][19] __logger.beginTask({locale, path}) / endTask({status, reason}) — режет плоский
+  // таймлайн на задачи (обычно "одна страница"), чтобы в bundle появился per-page рецепт.
+  function beginTask(meta) {
+    if (currentTask && !currentTask.endedAt) endTask({ status: 'superseded_by_next_task' });
+    currentTask = {
+      id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      startedAt: new Date().toISOString(),
+      startActionSeq: macroLog.length,
+      meta: sanitizeObject(meta || {}, 0, config.maxText)
+    };
+    pushRaw({ kind: 'task', type: 'begin', task: currentTask });
+    saveBackup(true);
+    console.log(`%c[logger] task начат`, 'color:cyan', currentTask.meta);
+    return currentTask;
+  }
+
+  function endTask(result) {
+    if (!currentTask) {
+      console.log('[logger] нет активной задачи — beginTask() не вызывался.');
+      return null;
+    }
+    currentTask.endedAt = new Date().toISOString();
+    currentTask.endActionSeq = macroLog.length;
+    currentTask.result = sanitizeObject(result || {}, 0, config.maxText);
+    pushRaw({ kind: 'task', type: 'end', task: currentTask });
+    tasksLog.push(currentTask);
+    const finished = currentTask;
+    currentTask = null;
+    saveBackup(true);
+    console.log(`%c[logger] task завершён`, 'color:cyan', finished.result);
+    return finished;
+  }
+
+  // [v7.1][18] inferredExpected угадывает по факту последствий, но человек в ручном
+  // прогоне знает больше ("здесь должно быть defer"). __logger.expect(...) и
+  // __logger.note(...) привязывают человеческое утверждение к текущему/последнему действию.
+  function expectFact(payload) {
+    const entry = { ...sanitizeObject(payload, 0, config.maxLargeText), at: new Date().toISOString() };
+    const a = currentActionForCorrelation() || lastInteractive();
+    if (a) {
+      a.humanExpected = a.humanExpected || [];
+      a.humanExpected.push(entry);
+      saveBackup(true);
+    }
+    pushRaw({ kind: 'expect', type: 'expect', actionId: a ? a.id : null, expect: entry });
+    console.log('%c[logger] expect зафиксирован', 'color:lime', entry);
+    return entry;
+  }
+
+  function note(text) {
+    const entry = { text: trunc(String(text), 2000), at: new Date().toISOString() };
+    const a = currentActionForCorrelation() || lastInteractive();
+    if (a) {
+      a.humanNotes = a.humanNotes || [];
+      a.humanNotes.push(entry);
+      saveBackup(true);
+    }
+    pushRaw({ kind: 'note', type: 'note', actionId: a ? a.id : null, note: entry });
+    console.log('%c[logger] заметка сохранена', 'color:lime', entry.text);
+    return entry;
   }
 
   function destroy() {
@@ -2701,17 +3842,25 @@
 
     ac.abort(); // [3] слушатели снимаются по-настоящему
 
-    try { window.fetch = native.fetch; } catch (_) {}
+    // [v7.1][13] fetch/XHR теперь патчатся по каждому окну (top + same-origin iframes) —
+    // восстанавливаем нативные реализации для всех, а не только для window.
+    for (const w of patchedWindowsList) {
+      const n = nativeByWindow.get(w);
+      if (!n) continue;
+      try { if (n.fetch) w.fetch = n.fetch; } catch (_) {}
+      try { if (n.xhrOpen) w.XMLHttpRequest.prototype.open = n.xhrOpen; } catch (_) {}
+      try { if (n.xhrSend) w.XMLHttpRequest.prototype.send = n.xhrSend; } catch (_) {}
+    }
     try { window.open = native.open; } catch (_) {}
     try { window.alert = native.alert; } catch (_) {}
     try { window.confirm = native.confirm; } catch (_) {}
     try { window.prompt = native.prompt; } catch (_) {}
     try { console.error = native.consoleError; } catch (_) {}
     try { console.warn = native.consoleWarn; } catch (_) {}
+    try { console.log = native.consoleLog; } catch (_) {}
+    try { console.info = native.consoleInfo; } catch (_) {}
     try { history.pushState = native.pushState; } catch (_) {}
     try { history.replaceState = native.replaceState; } catch (_) {}
-    try { XMLHttpRequest.prototype.open = native.xhrOpen; } catch (_) {}
-    try { XMLHttpRequest.prototype.send = native.xhrSend; } catch (_) {}
     try { HTMLAnchorElement.prototype.click = native.anchorClick; } catch (_) {}
     try { if (native.createObjectURL) URL.createObjectURL = native.createObjectURL; } catch (_) {}
 
@@ -2721,7 +3870,19 @@
     console.log('[logger] полностью выгружен.');
   }
 
-  buildPanel();
+  // [v7.1][12] нужен для запуска как content script на document_start (см. manifest.json) —
+  // патчить fetch/XHR/history/console нужно ДО того, как страница сделает первый запрос,
+  // но document.body в этот момент ещё может не существовать, а buildPanel() пишет в body.
+  function whenBodyReady(fn) {
+    if (document.body) { fn(); return; }
+    const obs = new MutationObserver(() => {
+      if (document.body) { obs.disconnect(); fn(); }
+    });
+    try { obs.observe(document.documentElement, { childList: true }); } catch (_) { fn(); }
+  }
+
+  whenBodyReady(buildPanel);
+  whenBodyReady(() => setTimeout(runIdAttributeDiscovery, 1200)); // даём странице отрендериться
 
   window.__logger = {
     version: VERSION,
@@ -2737,6 +3898,20 @@
     stop,
     clear,
     mark,
+    beginTask,
+    endTask,
+    tasksLog,
+    setMacroName,
+    expect: expectFact,
+    note,
+    registerProbe(name, fn) {
+      if (typeof fn !== 'function') throw new Error('probe must be a function');
+      probes[name] = fn;
+      console.log(`[logger] probe зарегистрирован: ${name}`);
+    },
+    unregisterProbe(name) {
+      delete probes[name];
+    },
     stats,
     setMode,
     setRoot(selector) {
@@ -2744,9 +3919,25 @@
       attachMutationObservers();
       console.log(`[logger] mutation root: ${selector || 'document.documentElement'}`);
     },
+    // [v7.2] тела запросов и без этого сохраняются для всего, что коррелирует с действием,
+    // или для ошибок — это только ручной override сверху общего правила (фоновые запросы,
+    // не привязанные ни к одному клику, но всё равно важные конкретно для вашего сайта)
+    captureBodiesFor(pattern) {
+      if (!pattern) return;
+      if (!config.bodyCaptureAllowlist.includes(pattern)) config.bodyCaptureAllowlist.push(pattern);
+      console.log(`[logger] тело запроса/ответа теперь всегда сохраняется для URL, содержащих: ${pattern}`);
+    },
+    rediscoverIdAttributes: runIdAttributeDiscovery,
+    setTestIdAttribute(name) {
+      if (!name) return;
+      config.testIdAttribute = name;
+      config.testIdAttributeManuallySet = true;
+      console.log(`[logger] testIdAttribute вручную установлен: ${name}`);
+    },
     export: exportBundle,
     exportAI: exportBundle,
     exportMacro,
+    exportPlan,
     exportPlaywright,
     generatePlaywright,
     copyLast,
@@ -2770,6 +3961,33 @@
     restoredRawEvents: restored ? rawLog.length : 0,
     restoredMacroActions: restored ? macroLog.length : 0
   });
+
+  // [v7.1][10] localStorage-восстановление выше синхронное и содержит только macroLog —
+  // полный rawLog/screenLog/networkLog догружаются из IndexedDB асинхронно и досливаются
+  // в те же массивы, на которые уже смотрят window.__actionLog/__screenLog/__networkLog.
+  if (restored && typeof indexedDB !== 'undefined') {
+    idbGet().then(payload => {
+      if (!payload || !payload.session || payload.session.id !== session.id) return;
+      let hydrated = 0;
+      if (Array.isArray(payload.rawLog) && payload.rawLog.length > rawLog.length) {
+        rawLog.length = 0; rawLog.push(...payload.rawLog);
+        rawSeq = rawLog.length ? Math.max(...rawLog.map(x => Number(x.seq) || 0)) + 1 : rawSeq;
+        hydrated++;
+      }
+      if (Array.isArray(payload.screenLog) && payload.screenLog.length > screenLog.length) {
+        screenLog.length = 0; screenLog.push(...payload.screenLog);
+        hydrated++;
+      }
+      if (Array.isArray(payload.networkLog) && payload.networkLog.length > networkLog.length) {
+        networkLog.length = 0; networkLog.push(...payload.networkLog);
+        hydrated++;
+      }
+      if (hydrated) {
+        schedulePanelUpdate();
+        console.log('%c[logger] полный бэкап (raw/screens/network) восстановлен из IndexedDB.', 'color:lime');
+      }
+    }).catch(() => {});
+  }
 
   console.log('%c[logger v7] запись идёт — AI-first Macro. Пройдите сценарий по порядку и нажмите «Стоп + экспорт».', 'color:cyan;font-weight:bold');
   console.log('[logger] debug: __logger.setMode("debug") | стоп: Ctrl+Shift+S | экспорт: __logger.export()');
