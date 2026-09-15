@@ -72,6 +72,38 @@
  *      видимого эффекта, неподтверждённые сетевые ошибки) — готовый чек-лист, а не то, что
  *      получателю нужно вычислять самому по всему таймлайну.
  *
+ * v7.3 — запись перестаёт быть только «хореографией кликов»: из неё теперь можно написать
+ * автоматизацию на API, а не только повтор нажатий. Всё взято из Migrator
+ * (python/src/migrator/network/recorder.py) — там эта дисциплина уже выстрадана:
+ *  [1] заголовки запроса и ответа записываются всегда (раньше — вообще никогда). Значения
+ *      секретных имён (authorization, cookie, x-csrf-token, x-api-key, ...) заменяются на
+ *      [REDACTED], но САМО ИМЯ сохраняется: скрипту нужно знать, что без этого заголовка
+ *      запрос не пройдёт, даже если значение из записи взять нельзя;
+ *  [2] тело ответа больше не обрезается ДО разбора (именованный баг №1 в Migrator): порядок
+ *      всегда parse -> redact -> bound, поэтому в записи лежит целая структура ответа, а не
+ *      оборванная строка, которую получатель не может распарсить;
+ *  [3] responseJson === '__UNPARSED__' означает «тело было, но это не JSON», и это НЕ то же
+ *      самое, что null (баг №2 в Migrator: «null vs [] must never be conflated»);
+ *      responseBodyCaptured:false — «тело не читали вовсе»;
+ *  [4] WebSocket, EventSource(SSE) и navigator.sendBeacon — раньше невидимы полностью.
+ *      Приложение на сокетах давало запись, по которой автоматизацию написать нельзя;
+ *      кадры кладутся в streams[] с привязкой к шагу, который их вызвал;
+ *  [5] payload.endpoints[] — инвентарь вызовов: METHOD + шаблон пути (/pages/1428 и
+ *      /pages/1429 — это один эндпоинт {int}), статусы, шаги-инициаторы, объединённая форма
+ *      request/response (__optional для ключа, который был не во всех вызовах), имена
+ *      нужных заголовков. Это и есть ответ на «что звать вместо кликов»;
+ *  [6] payload.authProfile — как сайт авторизуется, БЕЗ единого сохранённого секрета:
+ *      механизм (bearer/cookie), имена cookie и форма значений, ключи storage, похожие на
+ *      токен (jwt/hex/base64), запросы-кандидаты на логин, и прямое предупреждение, что
+ *      HttpOnly-cookie из JS не видны — пустой список не значит «cookie не используются»;
+ *  [7] __logger.exportHar() — сетевая часть в HAR 1.2: открывается в DevTools, Postman,
+ *      Insomnia и кодогенераторах, каждый запрос помнит шаг сценария (_actionId);
+ *  [8] __logger.exportApi() — только инвентарь + авторизация + краткий вывод, без таймлайна;
+ *  [9] openQuestions[] пополнились вопросами, на которых спотыкается именно автоматизация:
+ *      откуда брать токен, откуда CSRF, эндпоинт, который ни разу не ответил успешно;
+ * [10] бэкап версии 7.x теперь восстанавливается внутри мажора, а не выбрасывается при
+ *      любом несовпадении: терять из-за обновления скрипта живую запись хуже.
+ *
  * Команды:
  *   __logger.start() / pause() / stop() / destroy()
  *   __logger.stats() / clear()
@@ -83,13 +115,18 @@
  *   __logger.expect({ type, value }) / __logger.note(text)
  *   __logger.beginTask({ locale, path }) / endTask({ status })
  *   __logger.exportPlan()           // компактный JSON без сырых снапшотов/тел сети
+ *   __logger.exportApi()            // [v7.3] инвентарь эндпоинтов + профиль авторизации
+ *   __logger.exportHar()            // [v7.3] сетевая часть в HAR 1.2
  *   __logger.setMacroName(name)     // имя для файлов экспорта при множестве записей
  *   __logger.captureBodiesFor(pattern) / rediscoverIdAttributes() / setTestIdAttribute(name)
  */
 (function () {
   'use strict';
 
-  const VERSION = '7.2.0';
+  const VERSION = '7.3.0';
+  // Ключ бэкапа привязан к мажорной версии, а не к минорной: внутри v7 схема только
+  // дополняется, и запись, начатую до обновления скрипта, нельзя терять из-за смены имени
+  // ключа (гейт совместимости — в restored ниже).
   const STORAGE_KEY = '__actionLoggerBackup_v7_2';
   const IDB_NAME = '__actionLoggerBackupV7';
   const IDB_STORE = 'backup';
@@ -165,6 +202,12 @@
     trackWheel: false,
     trackDomMutations: false,
     trackNetwork: true,
+    // [v7.3] Транспорты, которых логгер раньше не видел вообще. Приложение на
+    // WebSocket/SSE давало запись, по которой автоматизацию написать нельзя: в сетевой
+    // части просто не было того, чем оно на самом деле разговаривает с сервером.
+    trackWebSockets: true,
+    trackEventSource: true,
+    trackBeacons: true,
     trackHover: true,
     trackActionEffects: true,
     captureScreenSnapshots: true,
@@ -176,6 +219,21 @@
     captureNetworkBodies: false,
     captureResponseBodies: false,
     snapshotHTML: false,
+
+    // [v7.3] Заголовки пишутся всегда: без Content-Type/Accept/X-Requested-With/CSRF по
+    // записи нельзя повторить запрос ничем, кроме того же самого клика. Значения секретных
+    // имён при этом не сохраняются никогда — см. redactHeaderMap.
+    captureRequestHeaders: true,
+    captureResponseHeaders: true,
+    // Кадры WebSocket/SSE — поток, а не событие: без потолка одна запись за пять минут
+    // выедает и IndexedDB-бэкап, и экспорт.
+    maxWsFramesPerSocket: 300,
+    maxWsFrameChars: 4000,
+    maxStreamEntries: 200,
+    // Профиль авторизации и инвентарь эндпоинтов — то, из чего пишется API-скрипт.
+    buildEndpointInventory: true,
+    buildAuthProfile: true,
+    endpointSampleUrls: 3,
 
     // [9][10] генерация теста
     playwrightTextMethod: 'fill', // fill | pressSequentially
@@ -342,7 +400,12 @@
   function sanitizeObject(value, depth = 0, limit = config.maxText) {
     if (depth > 5) return '[MAX_DEPTH]';
     if (value == null) return value;
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return trunc(value, limit);
+    if (typeof value === 'string') return trunc(value, limit);
+    // [v7.3] Раньше числа и булевы тоже проходили через trunc, а он возвращает String(value):
+    // записанное тело {"id":10,"async":true} превращалось в {"id":"10","async":"true"}, и по
+    // такой записи писался API-клиент, отправляющий строки вместо чисел. Тип сохраняем.
+    if (typeof value === 'number') return Number.isFinite(value) ? value : String(value);
+    if (typeof value === 'boolean') return value;
     if (Array.isArray(value)) return value.slice(0, 100).map(v => sanitizeObject(v, depth + 1, limit));
     if (typeof value === 'object') {
       const out = {};
@@ -469,6 +532,595 @@
     }
     console.log(`%c[logger] обнаружены вероятные test-id атрибуты сайта: ${found.join(', ')} (используется: ${config.testIdAttribute})`, 'color:lime');
   }
+
+  // ==================================================== [v7.3] network evidence helpers
+  // Всё между PURE-HELPERS-BEGIN и PURE-HELPERS-END не замыкается ни на config, ни на
+  // логи, ни на document — только аргументы и локальные константы. Поэтому этот блок
+  // вырезается из исходника и проверяется в node без браузера
+  // (test/network-evidence.test.mjs — приём взят из Migrator, test/discovery-resilience.test.mjs).
+  // Не добавляйте здесь обращений к внешним переменным: тест на этом падает.
+  // --- PURE-HELPERS-BEGIN ---
+
+  // [v7.3] Migrator, network/recorder.py: «`null` vs `[]` must never be conflated».
+  // Тело, которого не было, или которое не разобралось как JSON, помечается этим маркером,
+  // а не null: null означает ровно одно — в JSON пришёл литеральный null. Получатель записи
+  // не должен вычислять разницу между «сервер ответил null» и «мы не смогли прочитать».
+  const UNPARSED = '__UNPARSED__';
+
+  // [v7.3] Migrator, network/recorder.py DEFAULT_REDACTED_HEADER_NAMES. Значение секретного
+  // заголовка не сохраняется никогда — а имя сохраняется всегда. Будущему скрипту нужно
+  // знать, что запрос не пройдёт без Authorization/X-CSRF-Token, даже если сам токен из
+  // записи взять нельзя. Поэтому '[REDACTED]' на месте значения, а не удаление ключа.
+  const REDACTED_HEADER_NAMES = [
+    'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
+    'x-csrf-token', 'x-xsrf-token', 'x-csrftoken', 'x-auth-token', 'x-access-token',
+    'x-api-key', 'api-key', 'apikey', 'x-amz-security-token', 'x-session-token'
+  ];
+
+  // Заголовки, по которым пишется API-клиент: их значения — это контракт, не секрет.
+  const CONTRACT_HEADER_NAMES = [
+    'content-type', 'accept', 'accept-language', 'content-encoding', 'content-length',
+    'x-requested-with', 'location', 'retry-after', 'etag', 'if-match', 'if-none-match',
+    'prefer', 'x-http-method-override', 'idempotency-key'
+  ];
+
+  const BEARER_TOKEN_RE = /\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi;
+
+  function truncateString(value, maxChars) {
+    const s = String(value);
+    if (!maxChars || s.length <= maxChars) return s;
+    return s.slice(0, maxChars) + `...[+${s.length - maxChars}]`;
+  }
+
+  // Заголовки приходят четырьмя разными формами (Headers, {}, [[k,v]], сырая строка
+  // getAllResponseHeaders()) — нормализуем в один lower-case объект, чтобы дальше
+  // редакция и инвентарь эндпоинтов работали с одной формой.
+  function parseRawHeaderString(raw) {
+    const out = {};
+    if (!raw) return out;
+    for (const line of String(raw).split(/\r?\n/)) {
+      const i = line.indexOf(':');
+      if (i <= 0) continue;
+      const name = line.slice(0, i).trim().toLowerCase();
+      const value = line.slice(i + 1).trim();
+      if (!name) continue;
+      out[name] = out[name] ? `${out[name]}, ${value}` : value;
+    }
+    return out;
+  }
+
+  function headerMapOf(source) {
+    const out = {};
+    if (!source) return out;
+    try {
+      if (typeof source === 'string') return parseRawHeaderString(source);
+      if (typeof source.forEach === 'function' && typeof source.get === 'function') {
+        source.forEach((value, name) => { out[String(name).toLowerCase()] = String(value); });
+        return out;
+      }
+      if (Array.isArray(source)) {
+        for (const pair of source) {
+          if (!pair || pair.length < 2) continue;
+          out[String(pair[0]).toLowerCase()] = String(pair[1]);
+        }
+        return out;
+      }
+      for (const [name, value] of Object.entries(source)) {
+        if (value == null) continue;
+        out[String(name).toLowerCase()] = String(value);
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  function isSecretHeaderName(name, sensitivePattern) {
+    const lower = String(name || '').toLowerCase();
+    if (REDACTED_HEADER_NAMES.includes(lower)) return true;
+    if (CONTRACT_HEADER_NAMES.includes(lower)) return false;
+    return !!(sensitivePattern && sensitivePattern.test(lower));
+  }
+
+  function redactHeaderMap(headers, sensitivePattern, maxChars) {
+    const out = {};
+    for (const [name, value] of Object.entries(headers || {})) {
+      const lower = String(name).toLowerCase();
+      out[lower] = isSecretHeaderName(lower, sensitivePattern) ? '[REDACTED]' : truncateString(value, maxChars || 2000);
+    }
+    return out;
+  }
+
+  // [v7.3] Migrator, network/recorder.py redact_text_body: для не-JSON тела ключей нет,
+  // поэтому единственное, что можно вычистить надёжно — инлайновый `Bearer <token>`.
+  function redactTextBody(text) {
+    if (text == null) return text;
+    return String(text).replace(BEARER_TOKEN_RE, 'Bearer [REDACTED]');
+  }
+
+  // [v7.3] Migrator, network/recorder.py: «Never truncate before parsing». Раньше ответ
+  // обрезался до лимита и в лог уходила строка с оборванным JSON — получатель не мог её
+  // разобрать и не знал, что именно потерялось. Теперь порядок всегда parse -> redact ->
+  // bound: структура ответа сохраняется целиком, режутся только длинные строки внутри.
+  function parseJsonBody(text) {
+    if (text == null || text === '') return UNPARSED;
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return UNPARSED;
+    }
+  }
+
+  function redactJson(value, sensitivePattern, maxChars, depth) {
+    const level = depth || 0;
+    if (level > 8) return '[MAX_DEPTH]';
+    if (value == null) return value;
+    if (typeof value === 'string') return truncateString(redactTextBody(value), maxChars);
+    if (typeof value === 'number' || typeof value === 'boolean') return value;
+    if (Array.isArray(value)) {
+      const out = value.slice(0, 200).map(item => redactJson(item, sensitivePattern, maxChars, level + 1));
+      if (value.length > 200) out.push(`...[+${value.length - 200} items]`);
+      return out;
+    }
+    if (typeof value === 'object') {
+      const out = {};
+      for (const [key, item] of Object.entries(value).slice(0, 200)) {
+        out[key] = sensitivePattern && sensitivePattern.test(key)
+          ? '[REDACTED]'
+          : redactJson(item, sensitivePattern, maxChars, level + 1);
+      }
+      return out;
+    }
+    return truncateString(String(value), maxChars);
+  }
+
+  function boundText(text, maxChars) {
+    if (text == null) return { text: null, truncated: false, originalLength: 0 };
+    const s = String(text);
+    if (!maxChars || s.length <= maxChars) return { text: s, truncated: false, originalLength: s.length };
+    return { text: s.slice(0, maxChars), truncated: true, originalLength: s.length };
+  }
+
+  // ---------------------------------------------------- [v7.3] форма тела вместо значений
+  // Скрипт пишется по форме payload'а, а не по одному записанному значению: какие ключи,
+  // какие типы, что необязательно. Значения при этом остаются в самой записи — здесь
+  // только скелет, который можно показать в ТЗ, не раскрывая содержимое.
+  function jsonShape(value, depth, maxDepth) {
+    const level = depth || 0;
+    const limit = maxDepth || 6;
+    if (value === UNPARSED) return 'unparsed';
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (level >= limit) return 'unknown(max-depth)';
+    const type = typeof value;
+    if (type === 'string' || type === 'number' || type === 'boolean') return type;
+    if (Array.isArray(value)) {
+      if (!value.length) return [];
+      let merged;
+      for (const item of value.slice(0, 20)) merged = mergeShapes(merged, jsonShape(item, level + 1, limit));
+      return [merged];
+    }
+    if (type === 'object') {
+      const out = {};
+      for (const [key, item] of Object.entries(value).slice(0, 80)) out[key] = jsonShape(item, level + 1, limit);
+      return out;
+    }
+    return type;
+  }
+
+  // Один эндпоинт обычно вызывается в записи несколько раз с разными payload'ами. Берём
+  // объединение форм, а не последнюю: ключ, который был только в одном вызове, помечается
+  // __optional, а не исчезает из контракта.
+  function mergeShapes(a, b) {
+    if (a === undefined) return b;
+    if (b === undefined) return a;
+    if (JSON.stringify(a) === JSON.stringify(b)) return a;
+
+    const isPlain = x => !!x && typeof x === 'object' && !Array.isArray(x);
+    const unwrap = x => (isPlain(x) && '__optional' in x ? x.__optional : x);
+    const optionalA = isPlain(a) && '__optional' in a;
+    const optionalB = isPlain(b) && '__optional' in b;
+    if (optionalA || optionalB) {
+      const inner = mergeShapes(unwrap(a), unwrap(b));
+      return { __optional: inner };
+    }
+
+    if (isPlain(a) && isPlain(b) && !('__oneOf' in a) && !('__oneOf' in b)) {
+      const out = {};
+      for (const key of [...new Set([...Object.keys(a), ...Object.keys(b)])]) {
+        if (!(key in a)) out[key] = isPlain(b[key]) && '__optional' in b[key] ? b[key] : { __optional: b[key] };
+        else if (!(key in b)) out[key] = isPlain(a[key]) && '__optional' in a[key] ? a[key] : { __optional: a[key] };
+        else out[key] = mergeShapes(a[key], b[key]);
+      }
+      return out;
+    }
+
+    if (Array.isArray(a) && Array.isArray(b)) {
+      if (!a.length) return b;
+      if (!b.length) return a;
+      return [mergeShapes(a[0], b[0])];
+    }
+
+    const variants = [];
+    for (const value of [a, b]) {
+      const list = isPlain(value) && Array.isArray(value.__oneOf) ? value.__oneOf : [value];
+      for (const item of list) {
+        if (!variants.some(x => JSON.stringify(x) === JSON.stringify(item))) variants.push(item);
+      }
+    }
+    return variants.length === 1 ? variants[0] : { __oneOf: variants };
+  }
+
+  // -------------------------------------------- [v7.3] URL -> шаблон эндпоинта
+  // /api/pages/1428/assets/9f2c1d... и /api/pages/1429/assets/aa01... — это один эндпоинт.
+  // Без шаблонизации инвентарь распадается на сотню «уникальных» URL, и по нему нельзя
+  // понять, какие вызовы вообще есть у приложения.
+  function templatizeSegment(segment) {
+    const s = String(segment == null ? '' : segment);
+    if (!s) return s;
+    if (/^\d+$/.test(s)) return '{int}';
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return '{uuid}';
+    if (/^\d{4}-\d{2}-\d{2}(T[\d:.]+Z?)?$/.test(s)) return '{date}';
+    // Расширение сохраняем, а хеш внутри имени — нет: /static/app.a91f2c3d4e.js это
+    // app.{hash}.js. Иначе каждая сборка выглядит как новый эндпоинт. Части имени
+    // шаблонизируются по отдельности — в них точек уже нет, рекурсия конечна.
+    const dot = s.lastIndexOf('.');
+    if (dot > 0 && dot < s.length - 1 && /^[a-z0-9]{1,5}$/i.test(s.slice(dot + 1))) {
+      const stem = s.slice(0, dot).split('.').map(part => templatizeSegment(part)).join('.');
+      return `${stem}${s.slice(dot)}`;
+    }
+    if (/^[0-9a-f]{8,}$/i.test(s)) return '{hash}';
+    if (s.length >= 20 && /[A-Za-z]/.test(s) && /\d/.test(s) && !/[\s]/.test(s)) return '{token}';
+    return s;
+  }
+
+  function endpointKeyOf(method, url, baseHref) {
+    const verb = String(method || 'GET').toUpperCase();
+    let origin = '';
+    let path = String(url || '');
+    let queryKeys = [];
+    try {
+      const parsed = baseHref ? new URL(path, baseHref) : new URL(path);
+      origin = parsed.origin;
+      path = parsed.pathname;
+      queryKeys = [...new Set([...parsed.searchParams.keys()])].sort();
+    } catch (_) {
+      const cut = path.indexOf('?');
+      if (cut >= 0) path = path.slice(0, cut);
+    }
+    const pathTemplate = path.split('/').map((segment, index) => (index === 0 ? segment : templatizeSegment(segment))).join('/');
+    return { method: verb, origin, pathTemplate, queryKeys, key: `${verb} ${origin}${pathTemplate}` };
+  }
+
+  // ---------------------------------------- [v7.3] start/end/error -> одна запись запроса
+  // В networkLog один запрос лежит двумя-тремя строками (phase start/end/error). И HAR,
+  // и инвентарь эндпоинтов, и профиль авторизации хотят один запрос одной записью.
+  function foldRequests(networkEntries) {
+    const byId = new Map();
+    const order = [];
+    for (const entry of networkEntries || []) {
+      if (!entry) continue;
+      const id = entry.requestId || `seq-${entry.seq}`;
+      if (!byId.has(id)) {
+        byId.set(id, { requestId: id, transport: entry.transport || null, actionId: entry.actionId || null, seq: entry.seq });
+        order.push(id);
+      }
+      const record = byId.get(id);
+      if (entry.actionId && !record.actionId) record.actionId = entry.actionId;
+      if (entry.transport && !record.transport) record.transport = entry.transport;
+
+      if (entry.phase === 'start') {
+        record.method = entry.method || record.method || 'GET';
+        record.requestUrl = entry.requestUrl || record.requestUrl;
+        record.startedAt = entry.iso || record.startedAt;
+        record.startedAtMs = entry.t != null ? entry.t : record.startedAtMs;
+        if (entry.requestHeaders) record.requestHeaders = entry.requestHeaders;
+        if (entry.credentials !== undefined) record.credentials = entry.credentials;
+        if (entry.body !== undefined) record.requestBody = entry.body;
+      } else {
+        record.method = record.method || entry.method || 'GET';
+        record.requestUrl = record.requestUrl || entry.requestUrl;
+        record.phase = entry.phase;
+        if (entry.status !== undefined) record.status = entry.status;
+        if (entry.ok !== undefined) record.ok = entry.ok;
+        if (entry.finalUrl) record.finalUrl = entry.finalUrl;
+        if (entry.durationMs != null) record.durationMs = entry.durationMs;
+        if (entry.error) record.error = entry.error;
+        if (entry.responseHeaders) record.responseHeaders = entry.responseHeaders;
+        if (entry.responseJson !== undefined) record.responseJson = entry.responseJson;
+        if (entry.responsePreview !== undefined) record.responsePreview = entry.responsePreview;
+        if (entry.responseBodyCaptured !== undefined) record.responseBodyCaptured = entry.responseBodyCaptured;
+        if (entry.responseBodyBytes != null) record.responseBodyBytes = entry.responseBodyBytes;
+        record.endedAt = entry.iso || record.endedAt;
+      }
+    }
+    return order.map(id => byId.get(id));
+  }
+
+  function authCarriersOf(requestHeaders, credentials) {
+    const carriers = [];
+    const headers = requestHeaders || {};
+    for (const name of Object.keys(headers)) {
+      const lower = name.toLowerCase();
+      if (lower === 'authorization') carriers.push('header:authorization');
+      else if (lower.includes('csrf') || lower.includes('xsrf')) carriers.push(`header:${lower}`);
+      else if (lower === 'x-api-key' || lower === 'api-key' || lower === 'apikey') carriers.push(`header:${lower}`);
+      else if (lower === 'x-access-token' || lower === 'x-auth-token' || lower === 'x-session-token') carriers.push(`header:${lower}`);
+    }
+    // credentials:'include'/'same-origin' — единственный след cookie-авторизации, который
+    // виден из страницы: сам заголовок Cookie браузер добавляет после нашего хука и в JS
+    // не читается (см. authProfile.cookieHeaderNote).
+    if (credentials === 'include' || credentials === 'same-origin') carriers.push(`cookies:${credentials}`);
+    return [...new Set(carriers)];
+  }
+
+  // ------------------------------------------------- [v7.3] инвентарь эндпоинтов
+  // Итог: «какие вызовы есть у приложения, какой шаг их запускает, что в них лежит и что
+  // нужно, чтобы их позвать» — то, из чего пишется автоматизация на API вместо повтора
+  // кликов. Чистая функция: на входе свёрнутые запросы и действия, на выходе массив.
+  function buildEndpointInventory(foldedRequests, actions, options) {
+    const opts = options || {};
+    const maxSamples = opts.maxSamples || 3;
+    const ignoreSubstrings = opts.ignore || [];
+    const byAction = new Map();
+    for (const action of actions || []) if (action && action.id) byAction.set(action.id, action);
+
+    const endpoints = new Map();
+    for (const request of foldedRequests || []) {
+      if (!request || !request.requestUrl) continue;
+      if (ignoreSubstrings.some(pattern => String(request.requestUrl).includes(pattern))) continue;
+
+      const identity = endpointKeyOf(request.method, request.requestUrl, opts.baseHref);
+      let endpoint = endpoints.get(identity.key);
+      if (!endpoint) {
+        endpoint = {
+          key: identity.key,
+          method: identity.method,
+          origin: identity.origin,
+          pathTemplate: identity.pathTemplate,
+          sameOrigin: opts.baseOrigin ? identity.origin === opts.baseOrigin : null,
+          // GET/HEAD/OPTIONS можно звать при отладке безопасно; остальное меняет состояние
+          write: !['GET', 'HEAD', 'OPTIONS'].includes(identity.method),
+          transports: [],
+          calls: 0,
+          statuses: {},
+          failures: 0,
+          queryKeys: [],
+          sampleUrls: [],
+          requestHeaderNames: [],
+          authCarriers: [],
+          requestContentTypes: [],
+          responseContentTypes: [],
+          requestShape: undefined,
+          responseShape: undefined,
+          triggeredBy: [],
+          latencyMs: null,
+          errors: []
+        };
+        endpoints.set(identity.key, endpoint);
+      }
+
+      endpoint.calls += 1;
+      if (request.transport && !endpoint.transports.includes(request.transport)) endpoint.transports.push(request.transport);
+      for (const key of identity.queryKeys) if (!endpoint.queryKeys.includes(key)) endpoint.queryKeys.push(key);
+      if (endpoint.sampleUrls.length < maxSamples && !endpoint.sampleUrls.includes(request.requestUrl)) {
+        endpoint.sampleUrls.push(request.requestUrl);
+      }
+
+      const statusKey = request.status != null ? String(request.status) : (request.error ? 'error' : 'unknown');
+      endpoint.statuses[statusKey] = (endpoint.statuses[statusKey] || 0) + 1;
+      if (request.error || (request.status != null && request.status >= 400)) {
+        endpoint.failures += 1;
+        const message = request.error || `HTTP ${request.status}`;
+        if (endpoint.errors.length < maxSamples && !endpoint.errors.includes(message)) endpoint.errors.push(message);
+      }
+
+      for (const name of Object.keys(request.requestHeaders || {})) {
+        if (!endpoint.requestHeaderNames.includes(name)) endpoint.requestHeaderNames.push(name);
+      }
+      for (const carrier of authCarriersOf(request.requestHeaders, request.credentials)) {
+        if (!endpoint.authCarriers.includes(carrier)) endpoint.authCarriers.push(carrier);
+      }
+      const requestType = (request.requestHeaders || {})['content-type'];
+      if (requestType && !endpoint.requestContentTypes.includes(requestType)) endpoint.requestContentTypes.push(requestType);
+      const responseType = (request.responseHeaders || {})['content-type'];
+      if (responseType && !endpoint.responseContentTypes.includes(responseType)) endpoint.responseContentTypes.push(responseType);
+
+      if (request.requestBody !== undefined && request.requestBody !== null && request.requestBody !== '[BODY_NOT_CAPTURED]') {
+        endpoint.requestShape = mergeShapes(endpoint.requestShape, jsonShape(request.requestBody));
+      }
+      if (request.responseJson !== undefined && request.responseJson !== UNPARSED) {
+        endpoint.responseShape = mergeShapes(endpoint.responseShape, jsonShape(request.responseJson));
+      }
+
+      if (request.durationMs != null) {
+        const current = endpoint.latencyMs || { min: request.durationMs, max: request.durationMs };
+        endpoint.latencyMs = { min: Math.min(current.min, request.durationMs), max: Math.max(current.max, request.durationMs) };
+      }
+
+      const action = request.actionId ? byAction.get(request.actionId) : null;
+      if (action && !endpoint.triggeredBy.some(x => x.actionId === action.id)) {
+        endpoint.triggeredBy.push({ actionId: action.id, order: action.order != null ? action.order : null, action: action.action || null });
+      }
+    }
+
+    const list = [...endpoints.values()];
+    for (const endpoint of list) {
+      endpoint.queryKeys.sort();
+      endpoint.requestHeaderNames.sort();
+      // Запрос без единого шага-инициатора — фоновый: его нельзя воспроизвести «нажав
+      // то же самое», и в скрипте он обычно либо не нужен, либо нужен как отдельный вызов.
+      endpoint.background = endpoint.triggeredBy.length === 0;
+      if (endpoint.requestShape === undefined) delete endpoint.requestShape;
+      if (endpoint.responseShape === undefined) delete endpoint.responseShape;
+    }
+    // Сначала то, что меняет состояние и привязано к шагам — по нему пишут скрипт.
+    return list.sort((a, b) => {
+      if (a.background !== b.background) return a.background ? 1 : -1;
+      if (a.write !== b.write) return a.write ? -1 : 1;
+      return b.calls - a.calls || a.key.localeCompare(b.key);
+    });
+  }
+
+  // ------------------------------------------------------------- [v7.3] HAR 1.2
+  // Теперь, когда заголовки и тела есть, запись выражается в стандартном формате: HAR
+  // открывается в DevTools, Postman, Insomnia и почти любом кодогенераторе. Своя схема
+  // остаётся для смысла (шаги, локаторы, ожидания), HAR — чтобы сетевую часть можно было
+  // отдать инструменту, который про наш JSON никогда не слышал.
+  function harHeaderList(headers) {
+    return Object.entries(headers || {}).map(([name, value]) => ({ name, value: String(value) }));
+  }
+
+  function harQueryList(url) {
+    try {
+      return [...new URL(url).searchParams.entries()].map(([name, value]) => ({ name, value }));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function harBodyText(value) {
+    if (value == null || value === UNPARSED) return null;
+    if (typeof value === 'string') return value;
+    try { return JSON.stringify(value); } catch (_) { return null; }
+  }
+
+  function buildHarEntry(request) {
+    const requestHeaders = request.requestHeaders || {};
+    const responseHeaders = request.responseHeaders || {};
+    const requestText = harBodyText(request.requestBody === '[BODY_NOT_CAPTURED]' ? null : request.requestBody);
+    const responseText = harBodyText(request.responseJson !== undefined && request.responseJson !== UNPARSED
+      ? request.responseJson
+      : request.responsePreview);
+
+    const entry = {
+      startedDateTime: request.startedAt || request.endedAt || new Date(0).toISOString(),
+      time: request.durationMs != null ? request.durationMs : -1,
+      _requestId: request.requestId,
+      _transport: request.transport || null,
+      // Единственная причина, по которой HAR отсюда полезнее HAR из DevTools: каждый
+      // запрос знает шаг сценария, который его вызвал.
+      _actionId: request.actionId || null,
+      _phase: request.phase || null,
+      _error: request.error || null,
+      request: {
+        method: String(request.method || 'GET').toUpperCase(),
+        url: request.requestUrl || '',
+        httpVersion: 'HTTP/1.1',
+        cookies: [],
+        headers: harHeaderList(requestHeaders),
+        queryString: harQueryList(request.requestUrl),
+        headersSize: -1,
+        bodySize: requestText != null ? requestText.length : -1
+      },
+      response: {
+        status: request.status != null ? request.status : 0,
+        statusText: request.error ? 'ERROR' : '',
+        httpVersion: 'HTTP/1.1',
+        cookies: [],
+        headers: harHeaderList(responseHeaders),
+        content: {
+          size: request.responseBodyBytes != null ? request.responseBodyBytes : (responseText != null ? responseText.length : 0),
+          mimeType: responseHeaders['content-type'] || 'application/octet-stream'
+        },
+        redirectURL: responseHeaders.location || '',
+        headersSize: -1,
+        bodySize: responseText != null ? responseText.length : -1
+      },
+      cache: {},
+      timings: { send: 0, wait: request.durationMs != null ? request.durationMs : -1, receive: 0 }
+    };
+    if (requestText != null) {
+      entry.request.postData = { mimeType: requestHeaders['content-type'] || 'application/json', text: requestText };
+    }
+    if (responseText != null) entry.response.content.text = responseText;
+    return entry;
+  }
+
+  function buildHar(foldedRequests, meta) {
+    const info = meta || {};
+    return {
+      log: {
+        version: '1.2',
+        creator: { name: info.creatorName || 'action-logger', version: info.creatorVersion || '0' },
+        browser: info.browser ? { name: 'browser', version: String(info.browser) } : undefined,
+        pages: (info.pages || []).map(page => ({
+          startedDateTime: page.startedDateTime,
+          id: page.id,
+          title: page.title || '',
+          pageTimings: { onContentLoad: -1, onLoad: -1 }
+        })),
+        // HAR-редакция уже произошла выше: сюда попадают только заголовки/тела,
+        // прошедшие redactHeaderMap/redactJson. Секретов в экспорте нет by construction.
+        entries: (foldedRequests || []).filter(r => r && r.requestUrl).map(request => {
+          const entry = buildHarEntry(request);
+          if (info.pageRef) entry.pageref = info.pageRef;
+          return entry;
+        })
+      }
+    };
+  }
+
+  // ----------------------------------------- [v7.3] авторизация: форма вместо значения
+  // Главный вопрос любой будущей автоматизации — не «куда кликать», а «как войти».
+  // Ответ на него можно дать, не сохранив ни одного секрета: важно, что в storage лежит
+  // именно JWT (значит у него есть срок и его надо получать заново), а не то, какой.
+  // 'sid' и 'access' нельзя искать подстрокой: 'sidebarWidth' и 'lastAccessed' — не
+  // учётные данные, а ложный «здесь лежит токен» в профиле авторизации хуже пропуска.
+  const CREDENTIAL_NAME_RE = /token|jwt|auth|credential|bearer|oauth|refresh|sess(ion|id)|csrf|xsrf|api[-_]?key|access[-_]?key|(^|[^a-z])sid([^a-z]|$)/i;
+
+  function looksLikeCredentialName(name) {
+    return CREDENTIAL_NAME_RE.test(String(name || ''));
+  }
+
+  function tokenValueShape(value) {
+    if (value == null) return { kind: 'absent', length: 0 };
+    const s = String(value);
+    const shape = { kind: 'opaque', length: s.length };
+    if (!s.length) return { kind: 'empty', length: 0 };
+    // JWT распознаём по форме, не декодируя: три base64url-части через точку.
+    if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(s)) {
+      shape.kind = 'jwt';
+      shape.note = 'у JWT есть срок жизни — скрипт должен получать его заново, а не хранить';
+      return shape;
+    }
+    if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
+      shape.kind = 'json';
+      return shape;
+    }
+    if (/^[0-9a-f]{16,}$/i.test(s)) { shape.kind = 'hex'; return shape; }
+    if (/^[A-Za-z0-9+/=_-]{20,}$/.test(s)) { shape.kind = 'base64ish'; return shape; }
+    if (s.length < 8) { shape.kind = 'short'; return shape; }
+    return shape;
+  }
+
+  // document.cookie отдаёт одну строку — нам нужны только имена и форма значений.
+  function cookieNamesFrom(cookieString) {
+    const out = [];
+    for (const part of String(cookieString || '').split(';')) {
+      const eq = part.indexOf('=');
+      if (eq <= 0) continue;
+      const name = part.slice(0, eq).trim();
+      if (!name) continue;
+      const shape = tokenValueShape(part.slice(eq + 1).trim());
+      out.push({ name, valueShape: shape.kind, valueLength: shape.length, credentialLike: looksLikeCredentialName(name) || shape.kind === 'jwt' });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  // Итог по всем запросам: чем именно приложение доказывает серверу, кто оно.
+  function summarizeAuthCarriers(foldedRequests) {
+    const counts = {};
+    for (const request of foldedRequests || []) {
+      if (!request) continue;
+      for (const carrier of authCarriersOf(request.requestHeaders, request.credentials)) {
+        counts[carrier] = (counts[carrier] || 0) + 1;
+      }
+    }
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([carrier, requests]) => ({ carrier, requests }));
+  }
+
+  // --- PURE-HELPERS-END ---
 
   // ------------------------------------------------ [1] shadow-aware локаторы
 
@@ -1087,9 +1739,17 @@
       if (!saved) return null;
       const parsed = JSON.parse(saved);
       if (!parsed) return null;
-      if (parsed.version !== VERSION) {
+      // [v7.3] Раньше любое несовпадение версии выбрасывало бэкап целиком. Но внутри
+      // одной мажорной версии схема только дополняется (новые поля просто отсутствуют —
+      // см. ensureEffects), а теряется при этом самое дорогое: запись, которая шла в
+      // момент обновления скрипта. Несовместимой считаем только смену мажора.
+      const savedMajor = String(parsed.version || '').split('.')[0];
+      if (savedMajor !== VERSION.split('.')[0]) {
         native.consoleWarn.call(console, `[logger] бэкап версии ${parsed.version} несовместим с ${VERSION}, начинаю новую сессию.`);
         return null;
+      }
+      if (parsed.version !== VERSION) {
+        native.consoleWarn.call(console, `[logger] бэкап версии ${parsed.version} восстановлен в ${VERSION}: поля, добавленные после ${parsed.version}, у старых шагов будут пустыми.`);
       }
       return parsed;
     } catch (_) {
@@ -1130,12 +1790,17 @@
   // [v7.1][19] группировка по страницам/задачам — плоский таймлайн на 20 страниц читать
   // бесполезно, а per-page рецепт с фактическими значениями это то, из чего пишется код.
   const tasksLog = restored && Array.isArray(restored.tasksLog) ? restored.tasksLog : [];
+  // [v7.3] WebSocket/SSE — это поток кадров, а не пара запрос/ответ, поэтому живёт
+  // отдельным журналом; в networkLog при этом попадает сам handshake, чтобы адрес сокета
+  // был виден в инвентаре эндпоинтов наравне с HTTP.
+  const streamLog = restored && Array.isArray(restored.streamLog) ? restored.streamLog : [];
 
   window.__actionLog = rawLog;
   window.__macroLog = macroLog;
   window.__screenLog = screenLog;
   window.__networkLog = networkLog;
   window.__tasksLog = tasksLog;
+  window.__streamLog = streamLog;
 
   let recording = true;
   let rawSeq = rawLog.length ? Math.max(...rawLog.map(x => Number(x.seq) || 0)) + 1 : 0;
@@ -1221,6 +1886,7 @@
       macroLog,
       screenLog,
       networkLog,
+      streamLog,
       rawLog,
       tasksLog,
       currentTask,
@@ -1289,6 +1955,7 @@
     if (macroLog.length > config.maxMacroActions) macroLog.splice(0, macroLog.length - config.maxMacroActions);
     if (screenLog.length > config.maxScreenSnapshots) screenLog.splice(0, screenLog.length - config.maxScreenSnapshots);
     if (networkLog.length > config.maxNetworkEntries) networkLog.splice(0, networkLog.length - config.maxNetworkEntries);
+    if (streamLog.length > config.maxStreamEntries) streamLog.splice(0, streamLog.length - config.maxStreamEntries);
   }
 
   function pushRaw(entry) {
@@ -1414,7 +2081,10 @@
   }
 
   function ensureEffects(action) {
-    if (!action.effects) action.effects = { network: [], ui: [], dialogs: [], downloads: [], errors: [], navigation: null, popup: null };
+    if (!action.effects) action.effects = { network: [], ui: [], dialogs: [], downloads: [], errors: [], streams: [], navigation: null, popup: null };
+    // [v7.3] у действия, восстановленного из бэкапа v7.2, поля streams нет — дорисовываем,
+    // иначе первый же кадр WebSocket падает на push у undefined
+    if (!Array.isArray(action.effects.streams)) action.effects.streams = [];
     return action.effects;
   }
 
@@ -2696,6 +3366,49 @@
     return null;
   }
 
+  // [v7.3] Заголовки — то, без чего API-скрипт не написать: Content-Type, Accept,
+  // X-Requested-With, CSRF, кастомные заголовки приложения. Раньше не записывались вообще,
+  // и по логу нельзя было понять, чем запрос отличается от того же URL из curl.
+  function requestHeadersOf(input, init) {
+    if (!config.captureRequestHeaders) return undefined;
+    const fromInput = input && typeof input === 'object' && input.headers ? headerMapOf(input.headers) : {};
+    const fromInit = init && init.headers ? headerMapOf(init.headers) : {};
+    return redactHeaderMap({ ...fromInput, ...fromInit }, config.sensitiveNamePattern);
+  }
+
+  function responseHeadersOf(source) {
+    if (!config.captureResponseHeaders) return undefined;
+    return redactHeaderMap(headerMapOf(source), config.sensitiveNamePattern);
+  }
+
+  // Заголовок Cookie браузер добавляет после нашего хука и из JS не читается — режим
+  // credentials это единственный наблюдаемый признак того, что запрос шёл с cookie.
+  function credentialsOf(input, init) {
+    if (init && init.credentials) return init.credentials;
+    if (input && typeof input === 'object' && input.credentials) return input.credentials;
+    return 'same-origin';
+  }
+
+  // [v7.3] parse -> redact -> bound, в этом порядке (Migrator, network/recorder.py:
+  // «Never truncate before parsing»). Раньше ответ обрезался до лимита ДО разбора, и в
+  // запись уходил оборванный JSON — получатель не мог его прочитать и не знал, что
+  // потерялось. Теперь структура ответа сохраняется целиком, режутся строки внутри.
+  function responseBodyEvidence(text, limit) {
+    const out = { responseBodyCaptured: true, responseBodyBytes: text == null ? 0 : String(text).length };
+    const parsed = parseJsonBody(text);
+    if (parsed !== UNPARSED) {
+      out.responseJson = redactJson(parsed, config.sensitiveNamePattern, limit);
+      return out;
+    }
+    // Не JSON (html/csv/текст ошибки) — тогда текстовое превью, но с честным маркером:
+    // responseJson === UNPARSED означает «тело было, JSON'ом не является», а не «null».
+    out.responseJson = UNPARSED;
+    const bounded = boundText(text, limit);
+    out.responsePreview = redactTextBody(bounded.text);
+    out.responseTruncated = bounded.truncated;
+    return out;
+  }
+
   function pushNetwork(entry, actionId = null) {
     const item = {
       seq: networkLog.length,
@@ -2726,15 +3439,22 @@
 
   function patchNetwork(win) {
     if (!win || patchedWindows.has(win)) return;
-    let nativeFetch, nativeXhrOpen, nativeXhrSend;
+    let nativeFetch, nativeXhrOpen, nativeXhrSend, nativeXhrSetHeader, nativeWebSocket, nativeEventSource, nativeSendBeacon;
     try { nativeFetch = win.fetch; } catch (_) {}
     try { nativeXhrOpen = win.XMLHttpRequest && win.XMLHttpRequest.prototype.open; } catch (_) {}
     try { nativeXhrSend = win.XMLHttpRequest && win.XMLHttpRequest.prototype.send; } catch (_) {}
+    try { nativeXhrSetHeader = win.XMLHttpRequest && win.XMLHttpRequest.prototype.setRequestHeader; } catch (_) {}
+    try { nativeWebSocket = win.WebSocket; } catch (_) {}
+    try { nativeEventSource = win.EventSource; } catch (_) {}
+    try { nativeSendBeacon = win.navigator && win.navigator.sendBeacon; } catch (_) {}
     if (typeof nativeFetch !== 'function' && !(nativeXhrOpen && nativeXhrSend)) return;
 
     patchedWindows.add(win);
     patchedWindowsList.push(win);
-    nativeByWindow.set(win, { fetch: nativeFetch, xhrOpen: nativeXhrOpen, xhrSend: nativeXhrSend });
+    nativeByWindow.set(win, {
+      fetch: nativeFetch, xhrOpen: nativeXhrOpen, xhrSend: nativeXhrSend, xhrSetHeader: nativeXhrSetHeader,
+      webSocket: nativeWebSocket, eventSource: nativeEventSource, sendBeacon: nativeSendBeacon
+    });
 
     if (typeof nativeFetch === 'function') {
       win.fetch = function (input, init) {
@@ -2748,29 +3468,33 @@
         const correlated = currentActionForCorrelation(config.networkCorrelationMs);
         const actionId = correlated ? correlated.id : null;
         const body = requestBodyOf(input, init, url, actionId);
+        const requestHeaders = requestHeadersOf(input, init);
+        const credentials = credentialsOf(input, init);
 
-        pushRaw({ kind: 'network', type: 'fetch_start', requestId, actionId, requestUrl: url, method, body });
-        pushNetwork({ phase: 'start', transport: 'fetch', requestId, requestUrl: url, method, body }, actionId);
+        pushRaw({ kind: 'network', type: 'fetch_start', requestId, actionId, requestUrl: url, method, body, requestHeaders, credentials });
+        pushNetwork({ phase: 'start', transport: 'fetch', requestId, requestUrl: url, method, body, requestHeaders, credentials }, actionId);
 
         return nativeFetch.apply(this, arguments).then(res => {
           const base = {
             phase: 'end', transport: 'fetch', requestId,
             requestUrl: url, finalUrl: sanitizeUrl(res.url), method,
-            status: res.status, ok: res.ok, durationMs: Date.now() - start
+            status: res.status, ok: res.ok, durationMs: Date.now() - start,
+            responseHeaders: responseHeadersOf(res.headers)
           };
           const allow = shouldCaptureBody(url, { actionId, status: res.status, ok: res.ok })
             || shouldCaptureBody(res.url, { actionId, status: res.status, ok: res.ok });
 
           if (!config.captureResponseBodies && !allow) {
-            pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...base });
-            pushNetwork(base, actionId);
+            const skipped = { ...base, responseBodyCaptured: false };
+            pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...skipped });
+            pushNetwork(skipped, actionId);
             return res;
           }
 
           try {
             res.clone().text()
               .then(text => {
-                const withBody = { ...base, responsePreview: truncBytes(text, allow ? config.bodyCaptureAllowlistMaxBytes : config.maxText) };
+                const withBody = { ...base, ...responseBodyEvidence(text, allow ? config.bodyCaptureAllowlistMaxBytes : config.maxText) };
                 pushRaw({ kind: 'network', type: 'fetch_end', actionId, ...withBody });
                 pushNetwork(withBody, actionId);
               })
@@ -2791,9 +3515,24 @@
 
     if (nativeXhrOpen && nativeXhrSend && win.XMLHttpRequest) {
       win.XMLHttpRequest.prototype.open = function (method, url) {
-        this.__alMeta = { method: String(method || 'GET').toUpperCase(), rawUrl: url, url: sanitizeUrl(url) };
+        this.__alMeta = { method: String(method || 'GET').toUpperCase(), rawUrl: url, url: sanitizeUrl(url), headers: {} };
         return nativeXhrOpen.apply(this, arguments);
       };
+
+      // [v7.3] У XHR заголовки видны только здесь: getAllRequestHeaders в платформе нет,
+      // поэтому единственный способ узнать, с каким Content-Type/CSRF ушёл запрос —
+      // запомнить то, что приложение выставило само.
+      if (nativeXhrSetHeader) {
+        win.XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+          try {
+            if (this.__alMeta) {
+              if (!this.__alMeta.headers) this.__alMeta.headers = {};
+              this.__alMeta.headers[String(name).toLowerCase()] = String(value);
+            }
+          } catch (_) {}
+          return nativeXhrSetHeader.apply(this, arguments);
+        };
+      }
 
       win.XMLHttpRequest.prototype.send = function (body) {
         const meta = this.__alMeta;
@@ -2805,19 +3544,35 @@
         meta.actionId = correlated ? correlated.id : null;
         const allowRequest = shouldCaptureBody(meta.url, { actionId: meta.actionId });
         const requestBody = sanitizeBody(body, allowRequest);
-        pushRaw({ kind: 'network', type: 'xhr_start', requestId: meta.requestId, actionId: meta.actionId, requestUrl: meta.url, method: meta.method, body: requestBody });
-        pushNetwork({ phase: 'start', transport: 'xhr', requestId: meta.requestId, requestUrl: meta.url, method: meta.method, body: requestBody }, meta.actionId);
+        const requestHeaders = config.captureRequestHeaders ? redactHeaderMap(meta.headers || {}, config.sensitiveNamePattern) : undefined;
+        const credentials = this.withCredentials ? 'include' : 'same-origin';
+        pushRaw({ kind: 'network', type: 'xhr_start', requestId: meta.requestId, actionId: meta.actionId, requestUrl: meta.url, method: meta.method, body: requestBody, requestHeaders, credentials });
+        pushNetwork({ phase: 'start', transport: 'xhr', requestId: meta.requestId, requestUrl: meta.url, method: meta.method, body: requestBody, requestHeaders, credentials }, meta.actionId);
 
         this.addEventListener('loadend', () => {
           const ok = this.status >= 200 && this.status < 400;
           const allow = allowRequest || shouldCaptureBody(meta.url, { actionId: meta.actionId, status: this.status, ok });
+          let responseHeaders;
+          try { responseHeaders = responseHeadersOf(this.getAllResponseHeaders()); } catch (_) {}
           const base = {
             phase: 'end', transport: 'xhr', requestId: meta.requestId,
             requestUrl: meta.url, finalUrl: sanitizeUrl(this.responseURL), method: meta.method,
-            status: this.status, ok, durationMs: Date.now() - meta.start
+            status: this.status, ok, durationMs: Date.now() - meta.start,
+            responseHeaders
           };
           if (config.captureResponseBodies || allow) {
-            try { if (!this.responseType || this.responseType === 'text') base.responsePreview = truncBytes(this.responseText, allow ? config.bodyCaptureAllowlistMaxBytes : config.maxText); } catch (_) {}
+            let read = false;
+            try {
+              if (!this.responseType || this.responseType === 'text') {
+                Object.assign(base, responseBodyEvidence(this.responseText, allow ? config.bodyCaptureAllowlistMaxBytes : config.maxText));
+                read = true;
+              }
+            } catch (_) {}
+            // responseType=blob/arraybuffer: тело есть, но текстом его отсюда не взять —
+            // это надо сказать прямо, а не оставить получателя думать, что тела не было.
+            if (!read) base.responseBodyCaptured = false;
+          } else {
+            base.responseBodyCaptured = false;
           }
           pushRaw({ kind: 'network', type: 'xhr_end', actionId: meta.actionId, ...base });
           pushNetwork(base, meta.actionId);
@@ -2825,6 +3580,174 @@
 
         return nativeXhrSend.apply(this, arguments);
       };
+    }
+
+    // [v7.3] WebSocket. Возвращаем настоящий сокет с обёрнутым send и своими слушателями —
+    // при подмене на собственный класс у приложения ломаются instanceof и WebSocket.OPEN.
+    if (config.trackWebSockets && typeof nativeWebSocket === 'function') {
+      const LoggedWebSocket = function (url, protocols) {
+        const socket = protocols === undefined ? new nativeWebSocket(url) : new nativeWebSocket(url, protocols);
+        if (!config.trackNetwork || isIgnoredUrl(url) || internalDepth) return socket;
+
+        const correlated = currentActionForCorrelation(config.networkCorrelationMs);
+        const record = {
+          kind: 'websocket',
+          requestId: `ws-${++requestSeq}`,
+          url: sanitizeUrl(url),
+          protocols: protocols == null ? null : (Array.isArray(protocols) ? protocols.slice(0, 5).map(String) : [String(protocols)]),
+          actionId: correlated ? correlated.id : null,
+          openedAt: new Date().toISOString(),
+          frames: [],
+          framesDropped: 0,
+          closedAt: null,
+          closeCode: null,
+          closeReason: null,
+          errored: false
+        };
+        streamLog.push(record);
+        trimLogs();
+        pushRaw({ kind: 'network', type: 'websocket_open', requestId: record.requestId, actionId: record.actionId, requestUrl: record.url });
+        // Handshake попадает и в networkLog — чтобы адрес сокета был виден в инвентаре
+        // эндпоинтов наравне с HTTP, а не только внутри streams[].
+        pushNetwork({ phase: 'start', transport: 'websocket', requestId: record.requestId, requestUrl: record.url, method: 'GET' }, record.actionId);
+
+        const pushFrame = (direction, data) => {
+          if (!recording || internalDepth) return;
+          if (record.frames.length >= config.maxWsFramesPerSocket) { record.framesDropped += 1; return; }
+          const inFlight = currentActionForCorrelation(config.networkCorrelationMs);
+          const frame = { direction, at: new Date().toISOString(), actionId: inFlight ? inFlight.id : null, size: null };
+          try {
+            if (typeof data === 'string') {
+              frame.size = data.length;
+              const parsed = parseJsonBody(data);
+              if (parsed !== UNPARSED) frame.json = redactJson(parsed, config.sensitiveNamePattern, config.maxWsFrameChars);
+              else {
+                frame.json = UNPARSED;
+                const bounded = boundText(data, config.maxWsFrameChars);
+                frame.text = redactTextBody(bounded.text);
+                frame.truncated = bounded.truncated;
+              }
+            } else if (data && typeof data === 'object') {
+              // Бинарный кадр текстом не прочитать — говорим это прямо, а не пишем null.
+              frame.binary = true;
+              frame.size = data.size != null ? data.size : (data.byteLength != null ? data.byteLength : null);
+            }
+          } catch (_) {}
+          record.frames.push(frame);
+          const action = actionById(frame.actionId);
+          if (action) ensureEffects(action).streams.push({ socket: record.requestId, url: record.url, direction, at: frame.at });
+        };
+
+        try {
+          const nativeSend = socket.send;
+          socket.send = function (data) {
+            pushFrame('sent', data);
+            return nativeSend.apply(this, arguments);
+          };
+        } catch (_) {}
+
+        try {
+          socket.addEventListener('message', event => pushFrame('received', event && event.data));
+          socket.addEventListener('close', event => {
+            record.closedAt = new Date().toISOString();
+            record.closeCode = event && event.code != null ? event.code : null;
+            record.closeReason = event && event.reason ? trunc(event.reason, 200) : null;
+            pushNetwork({ phase: 'end', transport: 'websocket', requestId: record.requestId, requestUrl: record.url, method: 'GET', status: null, wsCloseCode: record.closeCode, frames: record.frames.length }, record.actionId);
+          });
+          socket.addEventListener('error', () => { record.errored = true; });
+        } catch (_) {}
+
+        return socket;
+      };
+      try {
+        LoggedWebSocket.prototype = nativeWebSocket.prototype;
+        for (const name of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) {
+          if (nativeWebSocket[name] !== undefined) LoggedWebSocket[name] = nativeWebSocket[name];
+        }
+        win.WebSocket = LoggedWebSocket;
+      } catch (_) {}
+    }
+
+    // [v7.3] EventSource (SSE). Односторонний поток, но для скрипта он часто и есть
+    // «результат» шага: нажали — и в стриме пришло событие с новым состоянием.
+    if (config.trackEventSource && typeof nativeEventSource === 'function') {
+      const LoggedEventSource = function (url, esConfig) {
+        const stream = esConfig === undefined ? new nativeEventSource(url) : new nativeEventSource(url, esConfig);
+        if (!config.trackNetwork || isIgnoredUrl(url) || internalDepth) return stream;
+
+        const correlated = currentActionForCorrelation(config.networkCorrelationMs);
+        const record = {
+          kind: 'eventsource',
+          requestId: `es-${++requestSeq}`,
+          url: sanitizeUrl(url),
+          withCredentials: !!(esConfig && esConfig.withCredentials),
+          actionId: correlated ? correlated.id : null,
+          openedAt: new Date().toISOString(),
+          frames: [],
+          framesDropped: 0,
+          errored: false
+        };
+        streamLog.push(record);
+        trimLogs();
+        pushRaw({ kind: 'network', type: 'eventsource_open', requestId: record.requestId, actionId: record.actionId, requestUrl: record.url });
+        pushNetwork({ phase: 'start', transport: 'eventsource', requestId: record.requestId, requestUrl: record.url, method: 'GET', credentials: record.withCredentials ? 'include' : 'same-origin' }, record.actionId);
+
+        try {
+          stream.addEventListener('message', event => {
+            if (!recording || internalDepth) return;
+            if (record.frames.length >= config.maxWsFramesPerSocket) { record.framesDropped += 1; return; }
+            const inFlight = currentActionForCorrelation(config.networkCorrelationMs);
+            const frame = { direction: 'received', at: new Date().toISOString(), actionId: inFlight ? inFlight.id : null, eventType: (event && event.type) || 'message', lastEventId: (event && event.lastEventId) || null };
+            const data = event && typeof event.data === 'string' ? event.data : null;
+            if (data != null) {
+              frame.size = data.length;
+              const parsed = parseJsonBody(data);
+              if (parsed !== UNPARSED) frame.json = redactJson(parsed, config.sensitiveNamePattern, config.maxWsFrameChars);
+              else {
+                frame.json = UNPARSED;
+                const bounded = boundText(data, config.maxWsFrameChars);
+                frame.text = redactTextBody(bounded.text);
+                frame.truncated = bounded.truncated;
+              }
+            }
+            record.frames.push(frame);
+            const action = actionById(frame.actionId);
+            if (action) ensureEffects(action).streams.push({ socket: record.requestId, url: record.url, direction: 'received', at: frame.at });
+          });
+          stream.addEventListener('error', () => { record.errored = true; });
+        } catch (_) {}
+
+        return stream;
+      };
+      try {
+        LoggedEventSource.prototype = nativeEventSource.prototype;
+        for (const name of ['CONNECTING', 'OPEN', 'CLOSED']) {
+          if (nativeEventSource[name] !== undefined) LoggedEventSource[name] = nativeEventSource[name];
+        }
+        win.EventSource = LoggedEventSource;
+      } catch (_) {}
+    }
+
+    // [v7.3] navigator.sendBeacon — «выстрелил и забыл». Ответа у него нет по определению,
+    // но сам факт и тело важны: часто именно так уходит подтверждение шага.
+    if (config.trackBeacons && typeof nativeSendBeacon === 'function') {
+      try {
+        win.navigator.sendBeacon = function (url, data) {
+          if (!config.trackNetwork || isIgnoredUrl(url) || internalDepth) return nativeSendBeacon.apply(win.navigator, arguments);
+          const correlated = currentActionForCorrelation(config.networkCorrelationMs);
+          const actionId = correlated ? correlated.id : null;
+          const requestId = `bc-${++requestSeq}`;
+          const safeUrl = sanitizeUrl(url);
+          const body = sanitizeBody(data, shouldCaptureBody(safeUrl, { actionId }));
+          const result = nativeSendBeacon.apply(win.navigator, arguments);
+          pushRaw({ kind: 'network', type: 'beacon', requestId, actionId, requestUrl: safeUrl, method: 'POST', body, queued: result !== false });
+          pushNetwork({ phase: 'start', transport: 'beacon', requestId, requestUrl: safeUrl, method: 'POST', body }, actionId);
+          // Ответа не будет никогда — закрываем запись сразу, чтобы свёртка запросов не
+          // считала её незавершённой, и помечаем, что тело ответа не «потерялось».
+          pushNetwork({ phase: 'end', transport: 'beacon', requestId, requestUrl: safeUrl, method: 'POST', status: null, queued: result !== false, responseBodyCaptured: false }, actionId);
+          return result;
+        };
+      } catch (_) {}
     }
   }
 
@@ -3025,7 +3948,7 @@
   // [v7.2] Собирает "что нужно уточнить у оператора" автоматически, по фактам записи —
   // цель в том, чтобы получателю (ассистенту, пишущему скрипт автоматизации) не пришлось
   // руками искать слабые места по всему таймлайну на каждую присланную запись.
-  function buildOpenQuestions(actions) {
+  function buildOpenQuestions(actions, context) {
     const out = [];
     for (const a of actions) {
       const hasHuman = !!((a.humanExpected && a.humanExpected.length) || (a.humanNotes && a.humanNotes.length));
@@ -3065,6 +3988,38 @@
         }
       }
     }
+
+    // [v7.3] Вопросы не только про шаги, но и про то, из чего будет собран скрипт: без
+    // ответа на «откуда брать токен» и «эти фоновые вызовы вообще нужны» автоматизация
+    // упирается в них на первом же запуске, а не на десятом.
+    const endpoints = (context && context.endpoints) || [];
+    const authProfile = context && context.authProfile;
+    if (authProfile && authProfile.mechanism === 'unknown' && endpoints.length) {
+      out.push({
+        type: 'auth_mechanism_unknown',
+        question: 'По записи не видно, как приложение авторизуется (ни Authorization, ни следов cookie-режима, а HttpOnly-cookie из JS не видны). Как оператор вошёл в систему и что должен делать скрипт — переиспользовать сохранённую сессию или логиниться сам?'
+      });
+    }
+    if (authProfile && authProfile.mechanism === 'bearer_header' && !authProfile.loginCandidates.length) {
+      out.push({
+        type: 'token_source_unknown',
+        question: 'Запросы несут Authorization, но запроса, который этот токен выдаёт, в записи нет (запись началась в уже залогиненной сессии). Откуда скрипт должен брать токен?'
+      });
+    }
+    if (authProfile && authProfile.csrfHeaders.length) {
+      out.push({
+        type: 'csrf_source_unknown',
+        question: `Запросы несут CSRF-заголовок (${authProfile.csrfHeaders.join(', ')}), значение в записи не сохранено. Откуда его берёт страница — из cookie, из meta-тега, из отдельного запроса?`
+      });
+    }
+    for (const endpoint of endpoints) {
+      if (endpoint.write && endpoint.failures && endpoint.failures === endpoint.calls) {
+        out.push({
+          type: 'endpoint_only_ever_failed',
+          question: `${endpoint.key} в записи вызывался ${endpoint.calls} раз(а) и ни разу не ответил успешно (${Object.keys(endpoint.statuses).join(', ')}). Это часть сценария или запись сломанного состояния?`
+        });
+      }
+    }
     return out;
   }
 
@@ -3089,7 +4044,7 @@
     }
   }
 
-  function generateDraftSpec(actions) {
+  function generateDraftSpec(actions, context) {
     const lines = [];
     lines.push('# Recorded scenario — technical draft');
     lines.push('');
@@ -3128,6 +4083,37 @@
       if (a.after) lines.push(`- after: ${a.after.title || ''} | ${a.after.url || ''}`);
       lines.push('');
     }
+
+    // [v7.3] ТЗ без сетевой части — это инструкция «куда нажимать». Сетевая часть
+    // отвечает на вопрос, можно ли вообще обойтись без нажатий.
+    const endpoints = (context && context.endpoints) || [];
+    const authProfile = context && context.authProfile;
+    if (authProfile) {
+      lines.push('## Authentication');
+      lines.push('');
+      lines.push(`- mechanism: ${authProfile.mechanism}`);
+      if (authProfile.observedCarriers.length) {
+        lines.push(`- observed carriers: ${authProfile.observedCarriers.map(c => `${c.carrier} (x${c.requests})`).join(', ')}`);
+      }
+      if (authProfile.loginCandidates.length) {
+        lines.push(`- login-looking endpoints: ${authProfile.loginCandidates.map(c => c.key).join(', ')}`);
+      }
+      lines.push(`- ${authProfile.recommendation}`);
+      lines.push('- No credential value is recorded anywhere in this bundle, by construction.');
+      lines.push('');
+    }
+    if (endpoints.length) {
+      lines.push('## API surface exercised by this recording');
+      lines.push('');
+      lines.push('| endpoint | calls | statuses | write | triggered by steps |');
+      lines.push('| --- | --- | --- | --- | --- |');
+      for (const endpoint of endpoints.slice(0, 80)) {
+        const statuses = Object.entries(endpoint.statuses).map(([code, count]) => `${code}x${count}`).join(' ');
+        const steps = endpoint.triggeredBy.map(t => t.order).filter(x => x != null).join(', ') || (endpoint.background ? 'background' : '-');
+        lines.push(`| \`${endpoint.key}\` | ${endpoint.calls} | ${statuses} | ${endpoint.write ? 'yes' : 'no'} | ${steps} |`);
+      }
+      lines.push('');
+    }
     return lines.join('\n');
   }
 
@@ -3144,7 +4130,17 @@
     const actions = macroLog.map(cleanActionForExport);
     const variables = buildVariables(actions);
     const warnings = buildWarnings(actions);
-    const openQuestions = buildOpenQuestions(actions);
+    // [v7.3] Свёртка start/end/error в один запрос — общая основа для инвентаря
+    // эндпоинтов, профиля авторизации и HAR. Считается один раз на экспорт.
+    const folded = foldRequests(networkLog);
+    const endpoints = config.buildEndpointInventory ? buildEndpointInventory(folded, actions, {
+      maxSamples: config.endpointSampleUrls,
+      ignore: config.networkIgnore,
+      baseHref: location.href,
+      baseOrigin: location.origin
+    }) : [];
+    const authProfile = config.buildAuthProfile ? buildAuthProfile(folded, endpoints) : null;
+    const openQuestions = buildOpenQuestions(actions, { endpoints, authProfile });
     const screens = dedupScreens(actions);
     const payload = {
       schema: 'action-logger-ai-v7',
@@ -3160,6 +4156,11 @@
         screenSnapshotsCaptured: screenLog.length,
         screenSnapshotsDeduped: screens.length,
         networkEntries: networkLog.length,
+        httpRequests: folded.length,
+        endpoints: endpoints.length,
+        stateChangingEndpoints: endpoints.filter(e => e.write).length,
+        streams: streamLog.length,
+        streamFrames: streamLog.reduce((sum, s) => sum + (s.frames ? s.frames.length : 0), 0),
         weakLocators: actions.filter(a => a.locatorConfidence && a.locatorConfidence.level === 'low').length,
         openQuestions: openQuestions.length,
         backupMode
@@ -3172,7 +4173,12 @@
         secrets: 'Values marked REDACTED must be parameterized, never guessed',
         locatorRule: 'Prefer high-confidence semantic/test-id locators; low-confidence locators require repair instead of blindly using .first()',
         popupRule: 'pageId separates browser pages when observable; target=_blank may be recorded but not instrumented by a one-shot page script',
-        openQuestionsRule: 'Resolve openQuestions[] with the user in one batch before writing automation for the affected steps — do not guess destructive/ambiguous steps silently'
+        openQuestionsRule: 'Resolve openQuestions[] with the user in one batch before writing automation for the affected steps — do not guess destructive/ambiguous steps silently',
+        endpointsRule: 'endpoints[] is the API surface this recording actually exercised: prefer calling a state-changing endpoint directly over replaying the clicks that triggered it, and write payloads against requestShape/responseShape (the union across every recorded call) rather than against one recorded value',
+        shapeMarkers: '__optional means the key was absent in at least one recorded call; __oneOf lists the alternative shapes seen at that position',
+        unparsedMarker: `${UNPARSED} means a body existed but is not JSON (see responsePreview) — it never means the value was null, and responseBodyCaptured:false means no body was read at all`,
+        authRule: 'authProfile says how the site authenticates, never with what: no token, cookie or header value is ever recorded. An empty cookies[] does not mean cookies are unused — HttpOnly cookies are invisible to page scripts',
+        streamsRule: 'streams[] carries WebSocket/SSE frames; if a step changed state with no HTTP request, look there before concluding the recording missed it'
       },
       timeline: actions,
       tasks: tasksLog,
@@ -3180,15 +4186,22 @@
       warnings,
       openQuestions,
       screens,
+      // [v7.3] API-часть записи: инвентарь вызовов, способ авторизации и короткий вывод
+      // «с чего начинать скрипт». Это и есть ответ на «что нужно, чтобы автоматизировать
+      // это потом», который раньше получателю приходилось собирать самому по network[].
+      brief: buildAutomationBrief(endpoints, authProfile),
+      endpoints,
+      authProfile,
+      streams: streamLog,
       network: networkLog,
       rawLog,
       generated: {
         playwright: generatePlaywright(),
-        technicalSpecMarkdown: config.generateDraftSpec ? generateDraftSpec(actions) : null
+        technicalSpecMarkdown: config.generateDraftSpec ? generateDraftSpec(actions, { endpoints, authProfile }) : null
       }
     };
     deliver(filename, JSON.stringify(payload, null, 2));
-    console.log(`[logger] AI bundle: ${rawLog.length} raw / ${actions.length} actions / ${networkLog.length} network / ${screenLog.length} screens`);
+    console.log(`[logger] AI bundle: ${rawLog.length} raw / ${actions.length} actions / ${networkLog.length} network / ${endpoints.length} endpoints / ${streamLog.length} streams / ${screenLog.length} screens`);
     if (openQuestions.length) {
       console.log(`%c[logger] ${openQuestions.length} открытых вопросов — см. payload.openQuestions`, 'color:orange');
     }
@@ -3236,7 +4249,12 @@
       possibleRetry: a.possibleRetry || null,
       requiresManualVerification: a.requiresManualVerification || false,
       artifacts: (a.artifacts || []).map(x => ({ name: x.name, size: x.size, contentHash: x.contentHash || null, contentCaptured: !!x.contentCaptured })),
-      network: (a.effects && a.effects.network || []).filter(n => n.phase !== 'start').map(n => ({ method: n.method, url: n.requestUrl, status: n.status, hasBody: n.responsePreview != null })),
+      network: (a.effects && a.effects.network || []).filter(n => n.phase !== 'start').map(n => ({
+        method: n.method, url: n.requestUrl, status: n.status,
+        // [v7.3] тело ответа теперь чаще лежит разобранным в responseJson, чем текстом
+        hasBody: (n.responseJson !== undefined && n.responseJson !== UNPARSED) || n.responsePreview != null
+      })),
+      streams: (a.effects && a.effects.streams || []).map(s => ({ url: s.url, direction: s.direction })),
       inferredExpected: a.inferredExpected || [],
       humanExpected: a.humanExpected || [],
       humanNotes: a.humanNotes || [],
@@ -3254,17 +4272,173 @@
   function exportPlan(filename = `action-plan-v7-${resolvedMacroName()}-${Date.now()}.json`) {
     finalizeAllActions();
     const actions = macroLog.map(cleanActionForExport);
+    // [v7.3] План — это то, что отдают вместо bundle, когда bundle не влезает в чат.
+    // Значит он не имеет права молча терять ответ на «как авторизоваться» и вопросы,
+    // без которых скрипт не написать: сам инвентарь компактный, тел сети в нём нет.
+    const folded = foldRequests(networkLog);
+    const endpoints = config.buildEndpointInventory ? buildEndpointInventory(folded, actions, {
+      maxSamples: 1,
+      ignore: config.networkIgnore,
+      baseHref: location.href,
+      baseOrigin: location.origin
+    }) : [];
+    const authProfile = config.buildAuthProfile ? buildAuthProfile(folded, endpoints) : null;
     const payload = {
       schema: 'action-logger-plan-v7',
       version: VERSION,
       exportedAt: new Date().toISOString(),
       session: { id: session.id, macroName: resolvedMacroName(), startUrl: session.startUrl, startedAt: session.startedAt },
       tasks: tasksLog,
-      openQuestions: buildOpenQuestions(actions),
+      brief: buildAutomationBrief(endpoints, authProfile),
+      authProfile,
+      endpoints: endpoints.map(e => ({
+        key: e.key, write: e.write, background: e.background, calls: e.calls, statuses: e.statuses,
+        authCarriers: e.authCarriers, requestShape: e.requestShape, responseShape: e.responseShape,
+        triggeredBy: e.triggeredBy
+      })),
+      openQuestions: buildOpenQuestions(actions, { endpoints, authProfile }),
       steps: buildPlan(actions)
     };
     deliver(filename, JSON.stringify(payload, null, 2));
-    console.log(`[logger] plan: ${payload.steps.length} шагов, ${payload.openQuestions.length} открытых вопросов`);
+    console.log(`[logger] plan: ${payload.steps.length} шагов, ${endpoints.length} эндпоинтов, ${payload.openQuestions.length} открытых вопросов`);
+    return payload;
+  }
+
+  // ------------------------------------- [v7.3] то, что нужно будущему скрипту, а не глазу
+  // Таймлайн отвечает на «куда нажимали». Этот раздел отвечает на три вопроса, без которых
+  // автоматизацию всё равно не написать: какие вызовы есть у приложения, как в него войти
+  // и в каком виде это отдать инструменту, который про нашу схему не знает (HAR).
+
+  function storageCredentialKeys(storage, sourceName) {
+    const out = [];
+    if (!storage) return out;
+    try {
+      for (let i = 0; i < storage.length; i++) {
+        const key = storage.key(i);
+        if (key == null || key === STORAGE_KEY) continue; // свой бэкап — не учётные данные сайта
+        let value = null;
+        try { value = storage.getItem(key); } catch (_) {}
+        const shape = tokenValueShape(value);
+        if (!looksLikeCredentialName(key) && shape.kind !== 'jwt') continue;
+        out.push({ source: sourceName, key, valueShape: shape.kind, valueLength: shape.length, note: shape.note || null });
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  const LOGIN_PATH_RE = /login|logon|signin|sign-in|auth|oauth|token|session|sso|refresh/i;
+
+  function buildAuthProfile(folded, endpoints) {
+    let cookies = [];
+    try { cookies = cookieNamesFrom(document.cookie); } catch (_) {}
+    const storageCredentials = [
+      ...storageCredentialKeys(typeof window !== 'undefined' ? window.localStorage : null, 'localStorage'),
+      ...storageCredentialKeys(typeof window !== 'undefined' ? window.sessionStorage : null, 'sessionStorage')
+    ];
+    const observedCarriers = summarizeAuthCarriers(folded);
+    const carrierNames = observedCarriers.map(x => x.carrier);
+    const loginCandidates = (endpoints || [])
+      .filter(e => e.write && LOGIN_PATH_RE.test(e.pathTemplate))
+      .map(e => ({ key: e.key, calls: e.calls, statuses: e.statuses }));
+
+    let mechanism = 'unknown';
+    let recommendation = 'Способ авторизации по записи не определился: запись могла начаться уже в залогиненной сессии, где ни одного авторизующего запроса не было. Спросите оператора, как он вошёл.';
+    if (carrierNames.includes('header:authorization')) {
+      mechanism = 'bearer_header';
+      recommendation = 'Запросы несут Authorization. Значение в записи не сохранено (и не должно быть): скрипт получает токен сам — либо запросом логина из loginCandidates, либо из окружения/секрета.';
+    } else if (carrierNames.some(x => x.startsWith('cookies:')) || cookies.length) {
+      mechanism = 'browser_cookies';
+      recommendation = 'Авторизация держится на cookie браузера. Для Playwright: войдите руками один раз и сохраните context.storageState() — воспроизводить сам логин обычно не нужно. Для curl/requests: cookie придётся прокидывать явно, значений в записи нет.';
+    }
+    const csrfHeaders = carrierNames.filter(x => x.includes('csrf') || x.includes('xsrf'));
+    if (csrfHeaders.length) {
+      recommendation += ` Плюс CSRF-заголовок (${csrfHeaders.join(', ')}): его значение берётся из живой страницы/cookie, константой из записи его зашить нельзя.`;
+    }
+
+    return {
+      origin: location.origin,
+      mechanism,
+      observedCarriers,
+      csrfHeaders,
+      cookies,
+      // Пустой список cookies НЕ означает «cookie не используются»: HttpOnly-cookie (а это
+      // почти все сессионные) из JS не видны вообще. Это надо сказать прямо, иначе получатель
+      // записи сделает ровно обратный вывод.
+      httpOnlyCookiesInvisible: true,
+      cookieHeaderNote: 'Заголовок Cookie браузер добавляет после хука логгера и в JS не читается — признаком cookie-авторизации служит режим credentials запроса, а не наличие заголовка.',
+      storageCredentials,
+      loginCandidates,
+      recommendation
+    };
+  }
+
+  // Одна страница на сессию — и только она. Разложить запросы по навигациям HAR-полем
+  // pageref можно было бы, но соответствие «запрос -> страница» пришлось бы угадывать по
+  // времени; навигации и без того лежат в таймлайне с точной привязкой к шагам.
+  function harPages() {
+    return [{ id: 'page-1', startedDateTime: session.startedAt, title: session.startTitle || session.startUrl || '' }];
+  }
+
+  function buildAutomationBrief(endpoints, authProfile) {
+    const writes = endpoints.filter(e => e.write && !e.background);
+    const weakest = endpoints.filter(e => e.failures > 0);
+    return {
+      // Короткий ответ на «с чего начинать скрипт», чтобы получателю не пришлось
+      // вычислять это самому по всему инвентарю.
+      authMechanism: authProfile ? authProfile.mechanism : null,
+      stateChangingEndpoints: writes.map(e => e.key),
+      backgroundEndpoints: endpoints.filter(e => e.background).length,
+      endpointsWithFailures: weakest.map(e => ({ key: e.key, statuses: e.statuses, errors: e.errors })),
+      apiFirstFeasible: writes.length > 0,
+      apiFirstNote: writes.length
+        ? 'Шаги, меняющие состояние, прошли через HTTP — их можно звать напрямую, не повторяя клики. Сверяйте requestShape/responseShape, а не одно записанное значение.'
+        : 'Ни один шаг, меняющий состояние, не дал HTTP-запроса в записи: либо всё идёт через WebSocket/SSE (см. streams), либо запись не покрыла сохранение. Автоматизация, скорее всего, остаётся UI-уровня.'
+    };
+  }
+
+  function buildHarPayload(folded) {
+    return buildHar(folded, {
+      creatorName: 'action-logger',
+      creatorVersion: VERSION,
+      pages: harPages(),
+      pageRef: 'page-1'
+    });
+  }
+
+  function exportHar(filename = `network-${resolvedMacroName()}-${Date.now()}.har`) {
+    const folded = foldRequests(networkLog);
+    const har = buildHarPayload(folded);
+    deliver(filename, JSON.stringify(har, null, 2));
+    console.log(`[logger] HAR: ${har.log.entries.length} запросов — открывается в DevTools/Postman/Insomnia`);
+    return har;
+  }
+
+  function exportApi(filename = `api-recipe-${resolvedMacroName()}-${Date.now()}.json`) {
+    finalizeAllActions();
+    const actions = macroLog.map(cleanActionForExport);
+    const folded = foldRequests(networkLog);
+    const endpoints = buildEndpointInventory(folded, actions, {
+      maxSamples: config.endpointSampleUrls,
+      ignore: config.networkIgnore,
+      baseHref: location.href,
+      baseOrigin: location.origin
+    });
+    const authProfile = buildAuthProfile(folded, endpoints);
+    const payload = {
+      schema: 'action-logger-api-v7',
+      version: VERSION,
+      exportedAt: new Date().toISOString(),
+      session: { id: session.id, macroName: resolvedMacroName(), startUrl: session.startUrl, startedAt: session.startedAt },
+      brief: buildAutomationBrief(endpoints, authProfile),
+      authProfile,
+      endpoints,
+      streams: streamLog.map(s => ({
+        kind: s.kind, url: s.url, actionId: s.actionId, frames: s.frames.length, framesDropped: s.framesDropped,
+        sample: s.frames.slice(0, 3)
+      }))
+    };
+    deliver(filename, JSON.stringify(payload, null, 2));
+    console.log(`[logger] API recipe: ${endpoints.length} эндпоинтов, авторизация — ${authProfile.mechanism}`);
     return payload;
   }
 
@@ -3536,7 +4710,8 @@
     const rawCounts = countsBy(rawLog, e => `${e.kind}:${e.type}`);
     const macroCounts = countsBy(macroLog, e => e.action);
     const weak = macroLog.filter(a => a.locatorConfidence && a.locatorConfidence.level === 'low').length;
-    console.log(`[logger] raw=${rawLog.length}, actions=${macroLog.length}, screens=${screenLog.length}, network=${networkLog.length}, weakLocators=${weak}, backup=${backupMode}, session=${session.id}`);
+    const frames = streamLog.reduce((sum, s) => sum + (s.frames ? s.frames.length : 0), 0);
+    console.log(`[logger] raw=${rawLog.length}, actions=${macroLog.length}, screens=${screenLog.length}, network=${networkLog.length}, streams=${streamLog.length}/${frames}кадров, weakLocators=${weak}, backup=${backupMode}, session=${session.id}`);
     console.table(Object.entries(rawCounts).sort((a, b) => b[1] - a[1]).map(([event, count]) => ({ event, count })));
     console.table(Object.entries(macroCounts).sort((a, b) => b[1] - a[1]).map(([action, count]) => ({ action, count })));
   }
@@ -3603,6 +4778,8 @@
           ${button('📊 Статы', '__al-stats')}
           ${button('💾 AI JSON', '__al-export')}
           ${button('📝 Plan', '__al-export-plan')}
+          ${button('🔌 API', '__al-export-api')}
+          ${button('🌐 HAR', '__al-export-har')}
           ${button('▶ PW отдельно', '__al-export-pw')}
           ${button('■ Стоп + экспорт', '__al-stop')}
           ${button('📋 Копия', '__al-copy')}
@@ -3632,6 +4809,8 @@
     });
     panel.querySelector('#__al-stats').addEventListener('click', stats);
     panel.querySelector('#__al-export').addEventListener('click', () => exportBundle());
+    panel.querySelector('#__al-export-api').addEventListener('click', () => exportApi());
+    panel.querySelector('#__al-export-har').addEventListener('click', () => exportHar());
     panel.querySelector('#__al-export-plan').addEventListener('click', () => exportPlan());
     panel.querySelector('#__al-export-pw').addEventListener('click', () => exportPlaywright());
     panel.querySelector('#__al-copy').addEventListener('click', copyLast);
@@ -3714,6 +4893,7 @@
     macroLog.length = 0;
     screenLog.length = 0;
     networkLog.length = 0;
+    streamLog.length = 0;
     tasksLog.length = 0;
     actionsById.clear();
     currentAction = null;
@@ -3850,6 +5030,10 @@
       try { if (n.fetch) w.fetch = n.fetch; } catch (_) {}
       try { if (n.xhrOpen) w.XMLHttpRequest.prototype.open = n.xhrOpen; } catch (_) {}
       try { if (n.xhrSend) w.XMLHttpRequest.prototype.send = n.xhrSend; } catch (_) {}
+      try { if (n.xhrSetHeader) w.XMLHttpRequest.prototype.setRequestHeader = n.xhrSetHeader; } catch (_) {}
+      try { if (n.webSocket) w.WebSocket = n.webSocket; } catch (_) {}
+      try { if (n.eventSource) w.EventSource = n.eventSource; } catch (_) {}
+      try { if (n.sendBeacon) w.navigator.sendBeacon = n.sendBeacon; } catch (_) {}
     }
     try { window.open = native.open; } catch (_) {}
     try { window.alert = native.alert; } catch (_) {}
@@ -3892,6 +5076,7 @@
     macroLog,
     screenLog,
     networkLog,
+    streamLog,
     log: rawLog,
     start,
     pause,
@@ -3938,6 +5123,10 @@
     exportAI: exportBundle,
     exportMacro,
     exportPlan,
+    // [v7.3] exportHar — сетевая часть в стандартном формате (DevTools/Postman/Insomnia);
+    // exportApi — только инвентарь вызовов и способ авторизации, без таймлайна.
+    exportHar,
+    exportApi,
     exportPlaywright,
     generatePlaywright,
     copyLast,
@@ -3980,6 +5169,10 @@
       }
       if (Array.isArray(payload.networkLog) && payload.networkLog.length > networkLog.length) {
         networkLog.length = 0; networkLog.push(...payload.networkLog);
+        hydrated++;
+      }
+      if (Array.isArray(payload.streamLog) && payload.streamLog.length > streamLog.length) {
+        streamLog.length = 0; streamLog.push(...payload.streamLog);
         hydrated++;
       }
       if (hydrated) {
