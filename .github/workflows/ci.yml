@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      # Логгер вставляется в консоль страницы одним куском: синтаксическая ошибка здесь
+      # означает, что оператор узнает о ней посреди записи сценария. Проверяем первым.
+      - run: npm run lint
+
+      - run: npm test
+
+      # Живая запись в настоящем Chromium — единственное, что доказывает, что
+      # инструментация действительно собирает данные. Без браузера тест сам себя пропустит,
+      # поэтому ставим его явно, а не полагаемся на skip.
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:integration
