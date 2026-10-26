@@ -123,13 +123,18 @@
 (function () {
   'use strict';
 
-  const VERSION = '7.3.0';
+  const VERSION = '7.4.0';
   // Ключ бэкапа привязан к мажорной версии, а не к минорной: внутри v7 схема только
   // дополняется, и запись, начатую до обновления скрипта, нельзя терять из-за смены имени
   // ключа (гейт совместимости — в restored ниже).
   const STORAGE_KEY = '__actionLoggerBackup_v7_2';
   const IDB_NAME = '__actionLoggerBackupV7';
   const IDB_STORE = 'backup';
+  // [v8] Под расширением SMM сессией владеет расширение (ext/background.js): журнал страницы
+  // не бэкапится в её localStorage/IndexedDB (другой origin = другое хранилище = «новая
+  // сессия», две вкладки одного сайта затирали друг другу бэкап), нет своей панели и
+  // горячих клавиш — состояние уходит в расширение через window.__smmHost (ext/page-bridge.js).
+  const host = window.__smmHost || null;
 
   if (window.__logger && window.__logger.version === VERSION) {
     window.__logger.showPanel();
@@ -178,8 +183,8 @@
 
     // [7] бэкап по времени, а не по количеству событий
     autoSaveMs: 2500,
-    autoRestore: true,
-    autoExportOnStop: true,
+    autoRestore: !host,
+    autoExportOnStop: !host,
 
     inputDebounceMs: 550,
     scrollThrottleMs: 300,
@@ -1773,7 +1778,7 @@
   }
 
   const session = restored && restored.session ? restored.session : {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: host ? host.docId : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     startedAt: new Date().toISOString(),
     startUrl: location.href,
     startTitle: document.title,
@@ -1838,7 +1843,7 @@
   // синхронного восстановления сразу после reload, ещё до того как откроется IndexedDB.
 
   let saveTimer = null;
-  let backupMode = 'full'; // full | macro-only | off
+  let backupMode = host ? 'off' : 'full'; // full | macro-only | off
   let idbHandle = null;
   let idbFailed = false;
 
@@ -2158,6 +2163,7 @@
     schedulePanelUpdate();
     saveBackup(false);
     scheduleFinalize(action);
+    if (host) host.action({ id: action.id, action: action.action, t: action.t, url: action.url, locator: action.locator || null, value: typeof action.value === 'string' ? trunc(action.value, 200) : null });
     return action;
   }
 
@@ -2840,7 +2846,7 @@
       if (!t || isIgnoredEl(t)) return;
 
       // [14] горячие клавиши самого логгера — не попадают в сценарий
-      if (e.ctrlKey && e.shiftKey && ['KeyM', 'KeyS'].includes(e.code)) {
+      if (!host && e.ctrlKey && e.shiftKey && ['KeyM', 'KeyS'].includes(e.code)) {
         e.preventDefault();
         e.stopPropagation();
         if (e.code === 'KeyM') {
@@ -3234,6 +3240,7 @@
     flushAllInputs();
     pushRaw({ kind: 'navigation', type: 'pagehide', fromUrl: location.href, toUrl: null });
     saveBackup(true);
+    if (host) { try { host.final(snapshotForHost()); } catch (_) {} }
   });
 
   onWin('beforeunload', () => {
@@ -3785,6 +3792,7 @@
 
   function deliver(filename, content, mime = 'application/json') {
     lastExport = { filename, content, mime, at: new Date().toISOString() };
+    if (host) return true; // [v8] под расширением всё уходит одним архивом по «Стоп»
     let ok = false;
     withInternal(() => {
       try {
@@ -4403,6 +4411,13 @@
       pages: harPages(),
       pageRef: 'page-1'
     });
+  }
+
+  // [v8] полный AI bundle и HAR этого документа — для архива расширения, без скачивания
+  function snapshotForHost() {
+    const bundle = exportBundle();
+    const har = buildHarPayload(foldRequests(networkLog));
+    return { bundle: JSON.stringify(bundle), har: JSON.stringify(har), actions: macroLog.length, requests: networkLog.length };
   }
 
   function exportHar(filename = `network-${resolvedMacroName()}-${Date.now()}.har`) {
@@ -5065,7 +5080,7 @@
     try { obs.observe(document.documentElement, { childList: true }); } catch (_) { fn(); }
   }
 
-  whenBodyReady(buildPanel);
+  if (!host) whenBodyReady(buildPanel);
   whenBodyReady(() => setTimeout(runIdAttributeDiscovery, 1200)); // даём странице отрендериться
 
   window.__logger = {
@@ -5181,6 +5196,8 @@
       }
     }).catch(() => {});
   }
+
+  if (host) host.listen({ snapshot: snapshotForHost, note, mark });
 
   console.log('%c[logger v7] запись идёт — AI-first Macro. Пройдите сценарий по порядку и нажмите «Стоп + экспорт».', 'color:cyan;font-weight:bold');
   console.log('[logger] debug: __logger.setMode("debug") | стоп: Ctrl+Shift+S | экспорт: __logger.export()');

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>SMM</title>
+  <style>
+    body { width: 300px; margin: 0; padding: 14px; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #1b1f24; background: #fff; }
+    @media (prefers-color-scheme: dark) { body { color: #e6e8eb; background: #1b1f24; } textarea { background: #11151a; color: #e6e8eb; border-color: #3a414a; } }
+    #state { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 8px; }
+    #dot { width: 10px; height: 10px; border-radius: 50%; background: #9aa0a6; }
+    #dot.on { background: #d93025; animation: blink 1.2s infinite; }
+    @keyframes blink { 50% { opacity: .35; } }
+    #stats { color: #6b7280; font-size: 12px; margin-bottom: 10px; min-height: 16px; }
+    button { width: 100%; padding: 9px; border-radius: 8px; border: 0; font: inherit; font-weight: 600; cursor: pointer; }
+    #toggle { background: #d93025; color: #fff; }
+    #toggle.stop { background: #1b1f24; }
+    @media (prefers-color-scheme: dark) { #toggle.stop { background: #e6e8eb; color: #1b1f24; } }
+    textarea { width: 100%; box-sizing: border-box; min-height: 64px; margin: 12px 0 6px; padding: 8px; border: 1px solid #cfd4da; border-radius: 8px; font: inherit; resize: vertical; }
+    #add { background: #e8eaed; color: #1b1f24; }
+    #add:disabled, textarea:disabled { opacity: .5; cursor: default; }
+    #msg { font-size: 12px; color: #188038; min-height: 16px; margin-top: 6px; }
+    button:focus-visible, textarea:focus-visible { outline: 2px solid #1a73e8; outline-offset: 2px; }
+  </style>
+</head>
+<body>
+  <div id="state"><span id="dot"></span><span id="label">Запись выключена</span></div>
+  <div id="stats"></div>
+  <button id="toggle">Старт</button>
+  <label for="note" style="position:absolute;left:-9999px">Комментарий</label>
+  <textarea id="note" placeholder="Комментарий к тому, что сейчас происходит (Ctrl+Enter)" disabled></textarea>
+  <button id="add" disabled>Добавить комментарий</button>
+  <div id="msg" role="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -222,7 +222,7 @@ live('кадры WebSocket записались и привязались к ш�
 
 live('HAR валиден, и каждый запрос в нём помнит свой шаг', () => {
   assert.equal(har.log.version, '1.2');
-  assert.equal(har.log.creator.version, '7.3.0');
+  assert.equal(har.log.creator.version, '7.4.0');
   const post = har.log.entries.find(e => e.request.method === 'POST' && e.request.url.includes('/assets'));
   assert.ok(post);
   assert.equal(post.response.status, 201);
